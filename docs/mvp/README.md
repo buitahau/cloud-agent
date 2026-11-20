@@ -10,6 +10,7 @@ Source design: [../architecture/cloud-test-agent-architecture.md](../architectur
 | Task | Title | Size | Depends on | Milestone |
 |---|---|---|---|---|
 | 00 | [Pre-flight: A3 answer and dev reachability](tasks/00-preflight.md) | S | none | A |
+| 00b | [Local smoke test (laptop stands in for the VPS)](tasks/00b-local-smoke.md) | M | none | A (optional, before 01) |
 | 01 | [VPS provisioning](tasks/01-vps-provisioning.md) | M | 00 | A |
 | 02 | [Manual E2E run from VPS against dev](tasks/02-manual-e2e-from-vps.md) | M | 01 | A |
 | 03 | [Claude headless auth spike](tasks/03-claude-headless-spike.md) | L | 01, 02 | A |
