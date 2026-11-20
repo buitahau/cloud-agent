@@ -42,7 +42,7 @@ Never reuse an `ANTHROPIC_API_KEY` on the VPS: it overrides the subscription log
 - [ ] **Node version** the repo expects (the plan installs Node 22 LTS; flag any mismatch).
 - [ ] **Env vars the suite needs**: base URL, test-account credentials, anything else (copy names from `.env.e2e`/CI config). List them in a scratch file for task 02.
 - [ ] **How the suite runs locally** (`npx playwright test`? extra args?). Task 04 will add an `e2e:ci` npm script: `playwright test --reporter=list,json`.
-- [ ] A **laptop run result** on a known commit (pass/fail counts, duration) to compare against the VPS baseline in task 02. Run it with `CI=1`.
+- [ ] A **laptop run result** on a known commit (pass/fail counts, duration) to compare against the VPS baseline in task 02. Run it with `CI=1` ([task 00b](tasks/00b-local-smoke.md) produces exactly this).
 - [ ] Playwright config: confirm `screenshot: 'only-on-failure'` (or `'on'`) and default `test-results/` output dir. If not, you will need to change it in the repo (task 04).
 - [ ] You can **commit to the repo** (tasks 04 and 10 add `CLAUDE.md` instructions and the `e2e:ci` script) and **force-push the branch `agent/test`** (the CLI does `git push -f origin HEAD:agent/test`). Check branch protection does not block that name. Use a dedicated branch name if several machines push.
 - [ ] The suite is **safe to run concurrently with your own manual use of dev** (shared dev data). Test accounts and one run at a time are the mitigation.
@@ -67,7 +67,7 @@ Never reuse an `ANTHROPIC_API_KEY` on the VPS: it overrides the subscription log
 
 ## 6. Suggested order for the first hour
 
-1. Make decisions D1–D5 and write the A3 answer (task 00 step 1).
+1. Make decisions D1–D5 and write the A3 answer (task 00 step 1). If the VPS is not ready yet, do [task 00b](tasks/00b-local-smoke.md) (laptop smoke test) first.
 2. Get the VPS and its public IP; run the two `curl` checks from it (task 00 step 2). **Stop here if dev is unreachable and cannot be allow-listed.**
 3. Create the GitHub PAT and the Tailscale account/auth key; collect the repo details in §3.
 4. Start [task 01](tasks/01-vps-provisioning.md).

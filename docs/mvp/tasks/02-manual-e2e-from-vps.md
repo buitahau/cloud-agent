@@ -18,7 +18,7 @@ Confirm A1 fully: the target repo's Playwright suite, run **by hand without Clau
 6. Run with the same settings the runner will use (`CI=1`, list+json reporters):
    `set -a; . /etc/cloudtest/project.env; set +a; CI=1 PLAYWRIGHT_JSON_OUTPUT_NAME=/tmp/baseline-pw.json /usr/bin/time -v npx playwright test --reporter=list,json 2>&1 | tee /tmp/baseline.log`
 7. Check that the Playwright config takes screenshots on failure (`screenshot: 'only-on-failure'` or `'on'`) and that `outputDir` is the default `test-results/`. If not, note the change needed; task 04 commits it to the target repo.
-8. If anything fails, sort it into: network (DNS, connect refused/timeout, 403 from an IP allow-list), environment (missing deps, fonts), or a real test failure. Compare with the same run on the laptop.
+8. If anything fails, sort it into: network (DNS, connect refused/timeout, 403 from an IP allow-list), environment (missing deps, fonts), or a real test failure. Compare with the same run on the laptop (the task 00b baseline, if done; same SHA).
 
 ## Acceptance criteria
 - [ ] The suite runs to completion on the VPS. The pass/fail counts match a laptop run on the same SHA (both with `CI=1`), or every difference is explained.

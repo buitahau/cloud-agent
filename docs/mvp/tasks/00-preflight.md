@@ -1,6 +1,6 @@
 # 00 — Pre-flight: A3 answer and dev reachability
 
-**Estimate:** S (≤ 1 h) · **Depends on:** none
+**Estimate:** S (≤ 1 h) · **Depends on:** none · If [task 00b](00b-local-smoke.md) was done, step 1 is already answered; only step 2 remains.
 
 ## Goal
 Answer the two questions that can end the project before any setup work: is a test against what dev currently serves meaningful (A3), and can the VPS reach dev at all (A1, first look)?
