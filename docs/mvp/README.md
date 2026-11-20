@@ -10,7 +10,7 @@ Source design: [../architecture/cloud-test-agent-architecture.md](../architectur
 | Task | Title | Size | Depends on | Milestone |
 |---|---|---|---|---|
 | 00 | [Pre-flight: A3 answer and dev reachability](tasks/00-preflight.md) | S | none | A |
-| 00b | [Local smoke test (laptop stands in for the VPS)](tasks/00b-local-smoke.md) | M | none | A (optional, before 01) |
+| 00b | [Local smoke test (laptop stands in for the VPS)](tasks/00b-local-smoke.md) | M | none (optional; nothing depends on it) | A (optional, before 01) |
 | 01 | [VPS provisioning](tasks/01-vps-provisioning.md) | M | 00 | A |
 | 02 | [Manual E2E run from VPS against dev](tasks/02-manual-e2e-from-vps.md) | M | 01 | A |
 | 03 | [Claude headless auth spike](tasks/03-claude-headless-spike.md) | L | 01, 02 | A |
@@ -59,7 +59,7 @@ Rules: the file is plain `KEY=value` lines (no `export`, no spaces around `=`), 
 | `TIMEOUT_MIN` | `20` | runner: cap on claude + suite only. A run's wall time is at most 2 (fetch) + 15 (install) + `TIMEOUT_MIN` min. |
 | `MAX_TURNS` | `30` | runner |
 | `MODEL` | required (pinned) | runner |
-| `BIND` | required (tailnet IP; `0.0.0.0` refused) | server |
+| `BIND` | required (tailnet IP; `127.0.0.1` in laptop tests, task 07; `0.0.0.0` refused) | server |
 | `PORT` | `8787` | server |
 | `RUNNER` | `/opt/cloudtest/vps/run-once.sh` | server (tests set `vps/fake-run.sh`) |
 | `RUNS_DIR` | `/var/lib/cloudtest/runs` | server (tests set a temp dir, task 07) |
@@ -123,6 +123,7 @@ The task index is at the top of this file. Order is chosen to remove the biggest
 | Task | Unknown it removes |
 |---|---|
 | 00 | **A3**, **A1** (first look) |
+| 00b | Suite and headless `claude -p` work at all (laptop); laptop baseline for task 02 |
 | 01 | Base machine, Tailscale, sizing, A2 hello-world |
 | 02 | **A1** in full, A6, baseline |
 | 03 | **A2 headless auth**, R1, A7 |
@@ -144,11 +145,13 @@ Dependency graph:
                                     └─► 09 ────────┴─► 10 ─► 11   (Milestone B)
 ```
 
+00b (laptop smoke test) is optional and sits outside the graph: do it before or alongside 00 while there is no VPS. It removes no VPS dependency.
+
 07 and 09 only need the runner contract (`meta.json` fields, runner exit codes) from task 04 (both are tested with the fake runner), so they can run in parallel with 05.
 
 Estimates: S ≤ 2 h, M ≈ half a day, L ≈ 1 day; task 05 is L but up to 2 days. The sizes add up to about 6.75 days; with slack the total is **7–8 working days**. Calendar time is longer: the 26 h soak (task 03 → 08) and the 24–48 h soak (task 11) add about 2–3 days of waiting, most of which overlaps other tasks. Tasks 00, 02 and 03 can each end the project early. If any fails, stop and change the design before writing code.
 
-Spike tasks (00, 01, 02, 03), task 06 and the demo (11) write short notes to `docs/mvp/findings/NN-*.md`. Later tasks use those notes as input.
+Spike tasks (00, 00b, 01, 02, 03), task 06 and the demo (11) write short notes to `docs/mvp/findings/NN-*.md`. Later tasks use those notes as input.
 
 ## Review responses
 
