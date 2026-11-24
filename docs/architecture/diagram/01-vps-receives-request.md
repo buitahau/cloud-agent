@@ -35,9 +35,9 @@ sequenceDiagram
     W->>GH: git fetch via GIT_ASKPASS (decrypted token)
     GH-->>W: objects for sha
     W->>W: clean worktree at sha
-    W->>W: inject env secrets (BASE_URL...), unset ANTHROPIC_API_KEY
+    W->>W: inject env secrets (E2E_BASE_URL...), unset ANTHROPIC_API_KEY
     W->>C: timeout + claude -p (read-only allowedTools, --max-turns)
-    C->>P: npm ci && npx playwright test
+    C->>P: bash scripts/e2e-ci.sh (pytest + Playwright)
     P->>Dev: browser E2E requests
     Dev-->>P: responses
     P-->>C: results, failures, screenshots

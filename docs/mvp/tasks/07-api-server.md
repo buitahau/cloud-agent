@@ -6,7 +6,7 @@
 Use an async job contract so that a run does not depend on the laptop staying connected: `POST` returns a `run_id` straight away, a serial worker runs `run-once.sh`, and `GET` returns status and report.
 
 ## Scope
-- In: `vps/server.mjs` (Node 22, no dependencies), bearer auth, `POST /api/runs`, `GET /api/runs/:id`, `GET /healthz`, an in-process serial queue, startup recovery, a fake runner for tests. The fake runner and `smoke.sh` run on the laptop and need `jq` there (the fake runner does the contract's `jq` merges).
+- In: `vps/server.mjs` (Node 24, no dependencies), bearer auth, `POST /api/runs`, `GET /api/runs/:id`, `GET /healthz`, an in-process serial queue, startup recovery, a fake runner for tests. The fake runner and `smoke.sh` run on the laptop and need `jq` there (the fake runner does the contract's `jq` merges).
 - Out: dashboard, artifact download, cancel, listing runs, multi-project.
 
 ## API contract

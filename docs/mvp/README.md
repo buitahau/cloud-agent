@@ -1,6 +1,6 @@
 # Cloud Test Agent — MVP Plan
 
-Status: plan, final (review round 5) · Date: 2026-11-19
+Status: plan, final (review round 5), adapted to the target repo's Python/pytest suite (R6) · Date: 2026-11-20
 Source design: [../architecture/cloud-test-agent-architecture.md](../architecture/cloud-test-agent-architecture.md), flows in [../architecture/diagram/](../architecture/diagram/).
 
 **How to use this plan.** Do the tasks below in number order (07 and 09 may run alongside 05, see §7). Each task file in `tasks/` has a goal, scope, numbered steps, acceptance criteria (ACs) and, for the risky ones, a stop condition: a task is done when every AC is ticked, and a stop condition means pause and change the design before writing more code. Tasks that discover facts write them to `docs/mvp/findings/NN-*.md`; later tasks read those notes. This README holds what the tasks share: the goal and demo (§1, §3), stack and config keys (§2), scope (§4–5), and risks (§6). Statuses, reasons and runner exit codes are defined once, in [task 04](tasks/04-prompt-and-report-contract.md).
@@ -29,7 +29,7 @@ Sizes: S ≤ 2 h, M ≈ half a day, L ≈ 1 day. Total: **7–8 working days**, 
 
 Prove, end to end and with the least code, that:
 
-> From the laptop, one command (run by hand or by Claude Code as a background command) sends the current commit to a VPS. There, a headless `claude -p` agent runs the repo's own Playwright E2E suite against the dev environment and returns a structured PASS/FAIL report. The laptop gets the report back even if it disconnected while the run was going.
+> From the laptop, one command (run by hand or by Claude Code as a background command) sends the current commit to a VPS. There, a headless `claude -p` agent runs the repo's own E2E suite (Python Playwright + pytest, the deployed-app folders fixed in task 04) against the dev environment and returns a structured PASS/FAIL report. The laptop gets the report back even if it disconnected while the run was going.
 
 The MVP proves the idea can work. It is not the product. Anything that does not help prove that is deferred.
 
@@ -37,26 +37,27 @@ The MVP proves the idea can work. It is not the product. Anything that does not 
 
 | Decision | Choice | Why |
 |---|---|---|
-| Language (server + CLI) | **Node.js 22 LTS, plain ESM JavaScript, no npm dependencies** (`node:http`, `node:fs`, `node:child_process`, `fetch`) | Node must be on the VPS anyway for Playwright, and the laptop already has it. With no dependencies there is no build step and no lockfile: two programs (`server.mjs`, `cloudtest.mjs`) plus one shell runner, and a few helper scripts. Python/FastAPI would add a second runtime for no gain. |
-| Runner (one test run) | **Bash script `run-once.sh`**, with classification in a small Node helper `classify.mjs` | Its work is git, `npm ci`, `timeout`, and starting `claude`, which is shell work. It can be run by hand (task 05), over SSH (task 06), and by the server (task 07). One code path covers all three. Parsing the transcript and `pw.json` is not shell work: `classify.mjs` does it and is tested on the laptop against fixtures (task 05). |
-| Run store / queue | **Files: `/var/lib/cloudtest/runs/<id>/{meta.json, report.md, transcript.jsonl, claude.json, claude.err, pw.json, run.log, artifacts/test-results/}`** | One user, one run at a time. You can inspect it with `ls`/`cat`, and it needs no schema or migrations. SQLite comes in with the dashboard (out of scope). `pw.json` (Playwright's JSON reporter) is the authority for counts; `transcript.jsonl` (claude `stream-json`) is the evidence of what the agent did; `claude.json` is its final `result` event. |
+| Language (server + CLI) | **Node.js 24, plain ESM JavaScript, no npm dependencies** (`node:http`, `node:fs`, `node:child_process`, `fetch`) | Node 24 must be on the VPS anyway for Claude Code and the target repo (`engines: >=24 <25`), and the laptop already has it. With no dependencies there is no build step and no lockfile: two programs (`server.mjs`, `cloudtest.mjs`) plus one shell runner, and a few helper scripts. Python is on the VPS only inside the suite's venv; the server and CLI do not use it. |
+| Runner (one test run) | **Bash script `run-once.sh`**, with classification in a small Node helper `classify.mjs` | Its work is git, `pnpm install`, `timeout`, and starting `claude`, which is shell work. It can be run by hand (task 05), over SSH (task 06), and by the server (task 07). One code path covers all three. Parsing the transcript and `junit.xml` is not shell work: `classify.mjs` does it (a dependency-free regex parse, task 04 step 4) and is tested on the laptop against fixtures (task 05). |
+| Run store / queue | **Files: `/var/lib/cloudtest/runs/<id>/{meta.json, report.md, transcript.jsonl, claude.json, claude.err, junit.xml, suite.rc, run.log, artifacts/}`** | One user, one run at a time. You can inspect it with `ls`/`cat`, and it needs no schema or migrations. SQLite comes in with the dashboard (out of scope). `junit.xml` (pytest `--junitxml`) is the authority for counts and `suite.rc` (pytest's exit status, written by the wrapper) for how the suite ended; `transcript.jsonl` (claude `stream-json`) is the evidence of what the agent did; `claude.json` is its final `result` event. |
 | Queue / worker | Serial in-memory queue inside the server process. On startup the server rescans the run dirs: `queued` goes back into the queue, and a stale `running` has its worktree removed and becomes `error: worker restarted` (systemd's cgroup kill has already stopped its processes) | This fixes the "stuck in running" gap from flow 1b without a separate worker process. |
 | Process manager | **systemd** service under a dedicated user `cloudtest` | It restarts on crash, keeps logs in journald, and needs no Docker. The Claude auth lives with that user. |
 | Network access | **Tailscale**: the server binds to the tailnet IP only, and we use a static bearer token | No public port, no TLS work, no Cloudflare setup. Fallback: `ssh -L` tunnel. |
 | Secrets | Files owned `root:cloudtest`, mode `0640`: `/etc/cloudtest/github-token`, `/etc/cloudtest/project.env`, `/etc/cloudtest/api-token` (and `/etc/cloudtest/claude-token` if task 03 picks `setup-token`) | The VPS has one service user and Claude credentials are plaintext for that user anyway, so encrypting files at rest adds no real protection at MVP stage. Deferred along with the dashboard. See R2 for what the test process can read. |
 | Project config | **One project**, set in `/etc/cloudtest/config.env` (keys in §2.1) | Multi-project support is out of scope. The API still takes `project` and returns 404 on a mismatch, so the contract does not change later. |
-| Node and Claude Code install | NodeSource Node 22 (`/usr/bin/node`); Claude Code via `sudo npm i -g @anthropic-ai/claude-code@<x.y.z>` (`/usr/bin/claude`, root-owned, so the service user cannot auto-update it); `--model` pinned; version recorded in `meta.json` | One install path, so the fixed `PATH=/usr/local/bin:/usr/bin:/bin` and `ExecStart=/usr/bin/node` hold. Flags and JSON fields must not change between the spike and the demo; usage must be comparable across runs. |
+| Node and Claude Code install | NodeSource Node 24 (`/usr/bin/node`); pnpm through `corepack enable` (shim in `/usr/bin`), pinned to the repo's `packageManager`; Claude Code via `sudo npm i -g @anthropic-ai/claude-code@<x.y.z>` (`/usr/bin/claude`, root-owned, so the service user cannot auto-update it; this is Node's own npm, not the target repo's toolchain); `--model` pinned; version recorded in `meta.json` | One install path, so the fixed `PATH=/usr/local/bin:/usr/bin:/bin` and `ExecStart=/usr/bin/node` hold. Flags and JSON fields must not change between the spike and the demo; usage must be comparable across runs. |
+| E2E toolchain | One shared venv `/var/lib/cloudtest/venv-e2e` (`python3-venv`; `playwright`, `pytest`, `pyyaml`, `axe-playwright-python` at versions pinned in task 01), Chromium system packages via its `playwright install-deps chromium` as root, the browser in `~cloudtest/.cache/ms-playwright`. The suite runs through **one committed wrapper, `bash scripts/e2e-ci.sh`**, in the target repo (task 04) | The target repo pins no Python versions, so a per-run `pip install` would drift and cost time; a venv built once keeps runs comparable. The wrapper fixes the folders, the JUnit path and the dev-URL guard, so the agent's single allowed command takes no arguments. |
 
 ### 2.1 Config keys
 
-`/etc/cloudtest/config.env` is read by the runner (task 05) and the server (task 07, via the unit's `EnvironmentFile`, task 08). This is the only list of keys.
+`/etc/cloudtest/config.env` is read by the runner (task 05) and the server (task 07, via the unit's `EnvironmentFile`, task 08). This section is the only list of keys: `config.env` first, then `project.env` below.
 
 Rules: the file is plain `KEY=value` lines (no `export`, no spaces around `=`), valid for both systemd and bash. The runner sources it at every start, so **the file wins over the inherited environment**, and the runner applies defaults after sourcing. To change a runner key, edit the file; no restart is needed. The server reads its keys from its environment once at start: changing a server key needs `systemctl restart cloudtest`.
 
 | Key | Default | Used by |
 |---|---|---|
 | `PROJECT` | required | runner (meta), server (404 on mismatch) |
-| `TIMEOUT_MIN` | `20` | runner: cap on claude + suite only. A run's wall time is at most 2 (fetch) + 15 (install) + `TIMEOUT_MIN` min. |
+| `TIMEOUT_MIN` | `20` | runner: cap on claude + suite only. A run's wall time is at most 2 (fetch) + 16 (install: 10 pnpm + 1 venv check + 5 browser) + `TIMEOUT_MIN` min. |
 | `MAX_TURNS` | `30` | runner |
 | `MODEL` | required (pinned) | runner |
 | `BIND` | required (tailnet IP; `127.0.0.1` in laptop tests, task 07; `0.0.0.0` refused) | server |
@@ -65,26 +66,34 @@ Rules: the file is plain `KEY=value` lines (no `export`, no spaces around `=`), 
 | `RUNS_DIR` | `/var/lib/cloudtest/runs` | server (tests set a temp dir, task 07) |
 | `API_TOKEN_FILE` | `/etc/cloudtest/api-token` | server (tests set a temp file, task 07) |
 
-The repo URL is the clone's `origin` (task 02); it is not a key.
+The repo URL is the clone's `origin` (task 02); it is not a key. The e2e folder list is not a key either: it lives in the target repo's `scripts/e2e-ci.sh` (task 04 step 1), versioned with the tests. The venv path `/var/lib/cloudtest/venv-e2e` is fixed, like `/etc/cloudtest`.
+
+`/etc/cloudtest/project.env` (task 02) holds the variables the **suite** reads; the runner loads it only inside the claude wrapper (task 05 step 9), never into its own environment. Same `KEY=value` format.
+
+| Key | Default | Used by |
+|---|---|---|
+| `E2E_BASE_URL` | required (the dev URL, `https://sweetmemories-dev.<account>.workers.dev`; `scripts/e2e-ci.sh` refuses anything else) | the suite |
+
+Never put `E2E_ALLOW_LOCAL`, `gh`, Neon or Cloudflare credentials there. `E2E_VENV`, `E2E_JUNIT` and `E2E_RC_FILE` are set by the runner per run (task 05 step 9), not configured.
 
 ## 3. Success criteria (demo script)
 
 The MVP is done when all of the following work on the real target repo and the real dev environment, and the results are written in `docs/mvp/findings/11-demo.md` (task 11).
 
-1. **Green run.** On the laptop, in the target repo: commit a trivial change, then run `cloudtest run <project>`. It prints `run_id`, then status updates, then `sha <sha>` and the report beginning `RESULT: PASS (N passed, 0 failed)`, and exits `0`. The printed `sha` matches `git rev-parse HEAD`.
-2. **Red run.** Commit a deliberately broken assertion and run again. The report shows `RESULT: FAIL`, the failing test with `file:line`, the error, and a screenshot path that exists under `<run_dir>/artifacts/` on the VPS. The CLI exits `1`. The counts equal `pw.json` (passed = `expected` + `flaky`, failed = `unexpected`).
+1. **Green run.** On the laptop, in the target repo: commit a trivial change, then run `cloudtest run <project>`. It prints `run_id`, then status updates, then `sha <sha>` and the report beginning `RESULT: PASS (N passed, 0 failed, S skipped)` with N ≥ 1 (and the BLOCKED skip block if S > 0), and exits `0`. The printed `sha` matches `git rev-parse HEAD`.
+2. **Red run.** Commit a deliberately broken pytest assertion in a test that uses the `page` fixture (task 04 step 7) and run again. The report shows `RESULT: FAIL`, the failing test with `file:line`, the error, and a screenshot path that exists under `<run_dir>/artifacts/` on the VPS. The CLI exits `1`. The counts equal `junit.xml` per task 04 step 4 (failed = `<failure>` + `<error>` test cases) and `suite.rc` is 1.
 3. **Disconnect survival.** Start a run, kill the CLI (Ctrl-C) or sleep the laptop, wait, then run `cloudtest wait <run_id>`. It gets the finished report.
 4. **Auth failure is explicit.** Make the Claude auth invalid with the method chosen in task 03 (move `~cloudtest/.claude/.credentials.json` aside, or put an invalid value in the long-lived token file). The run ends `status=error`, the reason is `claude auth failed`, and the CLI exits `2`. Restore afterwards.
-5. **Timeout is explicit.** Run the [timeout drill from task 05](tasks/05-runner-script.md) (`TIMEOUT_MIN=2` in the config file, a throwaway spec that keeps Chromium open for 10 min). The run ends `status=timeout`, the leak check from task 05 is empty afterwards, and the CLI exits `3`.
-6. **Agent-driven.** In Claude Code on the laptop, ask for a **test-code** change ("add an E2E assertion for heading X and verify it", seeded so the first run is red). The dev agent starts `cloudtest run` as a background command (`run_in_background: true` in the laptop transcript), reads the FAIL report, fixes the test, and the second run passes (the `CLAUDE.local.md` rule is followed without a reminder). The demo exercises test-code changes only: under A3, an app-code change on the branch does not change what dev serves.
-7. **Repeatability.** Do 5 consecutive green runs with no manual work on the VPS. Record the median wall time and its split as recorded in `meta.json`: fetch, install (`npm ci` + browser check), tests (`pw.json` duration), Claude overhead (claude time − test time).
+5. **Timeout is explicit.** Run the [timeout drill from task 05](tasks/05-runner-script.md) (`TIMEOUT_MIN=2` in the config file, a throwaway pytest test that keeps Chromium open for 10 min). The run ends `status=timeout`, the leak check from task 05 is empty afterwards, and the CLI exits `3`.
+6. **Agent-driven.** In Claude Code on the laptop, ask for a **test-code** change ("add an E2E assertion for heading X to a test in `e2e/project-skeleton` and verify it", seeded so the first run is red). The dev agent edits the pytest file, commits, starts `cloudtest run` as a background command (`run_in_background: true` in the laptop transcript), reads the FAIL report, fixes the test, and the second run passes (the `CLAUDE.local.md` rule is followed without a reminder). The demo exercises test-code changes only: under A3, an app-code change on the branch does not change what dev serves.
+7. **Repeatability.** Do 5 consecutive green runs with no manual work on the VPS. Record the median wall time and its split as recorded in `meta.json`: fetch, install (`pnpm install` + venv check + browser check), tests (`junit.xml` time), Claude overhead (claude time − test time).
 
 ## 4. In scope (basic features)
 
 - Laptop CLI `cloudtest` with commands `run <project>` and `wait <run_id>`. It force-pushes `HEAD:refs/heads/agent/test`, POSTs the run, polls every 5 s within a deadline, prints the report, and uses defined exit codes.
 - VPS HTTP API: `POST /api/runs` (202, and the same SHA already queued or running returns the existing run), `GET /api/runs/:id`, and `GET /healthz`.
-- Serial runner: fetch by SHA with a token via `GIT_ASKPASS` (with timeout), a clean worktree per run, `npm ci` + browser check in the runner, `timeout` plus a kill of every process under the run's worktree and any Playwright browser, `claude -p` with the tools `Read/Grep/Glob/Bash` where the only allowed Bash command is `npm run e2e:ci`, `--max-turns`, and a clean `env -i` environment.
-- A fixed run prompt and a machine-parsable report contract (first line `RESULT: PASS|FAIL|ERROR ...`); pass/fail and counts come from `pw.json` and the suite command's exit status, the runner writes line 1, the agent writes the diagnosis.
+- Serial runner: fetch by SHA with a token via `GIT_ASKPASS` (with timeout), a clean worktree per run, `pnpm install --frozen-lockfile` + venv and browser check in the runner, `timeout` plus a kill of every process under the run's worktree, any Playwright browser and any process of the E2E venv, `claude -p` with the tools `Read/Grep/Glob/Bash` where the only allowed Bash command is `bash scripts/e2e-ci.sh`, `--max-turns`, and a clean `env -i` environment.
+- A fixed run prompt and a machine-parsable report contract (first line `RESULT: PASS|FAIL|ERROR ...`); pass/fail and counts come from pytest's `junit.xml` and the suite's exit status (`suite.rc`), a green needs at least one executed test, the runner writes line 1 (with skip and BLOCKED counts), the agent writes the diagnosis.
 - Statuses `queued`, `running`, `done` (pass/fail), `error` (with a reason), `timeout`. The single list of conditions and reasons is the classification table in [task 04](tasks/04-prompt-and-report-contract.md).
 - A laptop-only `CLAUDE.local.md` rule in the target repo so the dev agent uses `cloudtest` instead of running tests locally.
 
@@ -100,7 +109,7 @@ The MVP is done when all of the following work on the real target repo and the r
 | Docker per run, sandboxing, separate test user | It is our own repo on our own VPS. A fresh worktree per run is enough isolation for now (see R2). |
 | Deploying the branch to dev before testing | **MVP assumption:** tests target whatever dev currently serves (see A3). |
 | SSE/webhooks/MCP wrapper, cancel endpoint, auto-retry, `status` command, artifact retention job | Polling with `wait` covers the flow. Cleanup is a manual `rm` for now; task 11 measures disk growth. |
-| Failure-only Claude mode (run Playwright directly, call Claude only on red) | A good cost optimisation later. The MVP has to prove that the Claude-driven path works. |
+| Failure-only Claude mode (run the suite directly, call Claude only on red) | A good cost optimisation later. The MVP has to prove that the Claude-driven path works. |
 
 ## 6. Key assumptions and risks
 
@@ -108,13 +117,13 @@ The MVP is done when all of the following work on the real target repo and the r
 |---|---|---|---|
 | A1 | **The VPS can reach the dev environment** (no VPN or IP allow-list, or the VPS IP can be added to one) | The project is blocked or needs a VPN client on the VPS | Task 00 (`curl` from the VPS), confirmed by the full suite run in task 02 |
 | A2 | **`claude -p` runs headless from systemd** under the `cloudtest` user, using the subscription (login or `setup-token`), with no TTY and no prompts, and auth survives for days | Runs hang or fail, or need frequent manual re-login | Task 01 (hello-world under `systemd-run`), task 03 (spike, auth method, 26 h soak timer), task 08 (service), task 11 (≥ 24 h soak) |
-| A3 | The tests are meaningful against what dev currently serves, so no deploy of the branch is needed | Green/red reflects dev, not my commit. The MVP then proves the plumbing only, and a deploy step becomes the next task. The demo uses test-code changes either way. | Answered in writing in task 00 |
-| A4 | The repo's `CLAUDE.md` says how to run E2E (`npm run e2e:ci`, base URL env) | The agent guesses or wanders and burns turns | Task 04 commits the script and instructions; task 03 checks `CLAUDE.md` still loads with the chosen settings flags |
-| A5 | The agent's report reflects reality and does not hallucinate pass/fail | A false green is the worst failure mode | Task 04: `pw.json` plus the suite command's exit status decide pass/fail; the runner writes line 1 and records whether the agent's line agreed (`agent_line_ok`); exactly one executed suite run per transcript; missing `pw.json` or Playwright errors are an error |
+| A3 | The tests are meaningful against what dev currently serves, so no deploy of the branch is needed. For this repo dev is deployed only from merges into `dev-v2`, so a green means: **the test code at the pushed SHA, in the deployed-app folders only (`e2e/project-skeleton`, `e2e/homepage`), passes against the app dev currently serves.** It says nothing about the SHA's app code, and nothing about the static, `gh`- or credential-gated folders, which the MVP does not run. | Green/red reflects dev, not my commit. The MVP then proves the plumbing only, and a deploy step becomes the next task. The demo uses test-code changes either way. | Answered in writing in task 00; folder list from tasks 00b/02, fixed in task 04 |
+| A4 | The repo's `CLAUDE.md` says how the cloud runner runs E2E (`bash scripts/e2e-ci.sh`, `E2E_BASE_URL`); today it only points at `e2e/README.md`, whose local flow (`with_server.py`, `pnpm start`) the VPS agent must not use | The agent guesses or wanders and burns turns | Task 04 commits the wrapper and a Cloud E2E section; task 03 checks `CLAUDE.md` still loads with the chosen settings flags and that variants of the command are denied |
+| A5 | The agent's report reflects reality and does not hallucinate pass/fail | A false green is the worst failure mode; with this suite a green made only of skips (BLOCKED) is the second | Task 04: `junit.xml` plus `suite.rc` decide pass/fail; the runner writes line 1 and records whether the agent's line agreed (`agent_line_ok`); exactly one executed suite run per transcript; a missing or unparsable `junit.xml`, a pytest exit other than 0/1, and zero executed tests are errors; skip and BLOCKED counts are in line 1 and `meta.json` |
 | A6 | The VPS has enough resources for Chromium plus the suite (target 4 vCPU / 8 GB) | Flaky timeouts on the VPS | Task 01 measures, task 02 records peak RSS |
 | A7 | Subscription usage per run is acceptable | Hitting rate limits mid-day | Task 03 records turns/usage per run; usage-limit errors show up as `claude failed: <message>`; task 11 totals all runs |
 | R1 | A repo-level `.claude/settings.json` or hooks in the target repo could widen the agent's permissions | The agent could edit files | Task 03 checks how repo settings interact with the flags (`--setting-sources`). The worktree is thrown away afterwards anyway. |
-| R2 | **Accepted MVP risk:** `npm ci` and the Playwright tests execute repo code as `cloudtest`, which can read `/etc/cloudtest/*` and the Claude credentials. This is weaker than architecture §8 ("token never passed to the test process"): the token is kept out of the environment, not out of reach. | A malicious dependency or test could read the read-only single-repo PAT, the API token and the Claude auth | Own repo, read-only single-repo PAT, tailnet-only API. The agent itself has no allow rule for read tools and is denied `Read(//etc/cloudtest/**)` and `Read(~/.claude/**)`, which also cover `Grep`/`Glob` (task 03). A separate run user is the post-MVP fix. |
+| R2 | **Accepted MVP risk:** `pnpm install` (package scripts) and the pytest suite execute repo code as `cloudtest` (which also owns the shared venv), which can read `/etc/cloudtest/*` and the Claude credentials. This is weaker than architecture §8 ("token never passed to the test process"): the token is kept out of the environment, not out of reach. | A malicious dependency or test could read the read-only single-repo PAT, the API token and the Claude auth | Own repo, read-only single-repo PAT, tailnet-only API. The agent itself has no allow rule for read tools and is denied `Read(//etc/cloudtest/**)` and `Read(~/.claude/**)`, which also cover `Grep`/`Glob` (task 03). A separate run user is the post-MVP fix. |
 
 ## 7. Order, dependencies and estimates
 
@@ -123,9 +132,9 @@ The task index is at the top of this file. Order is chosen to remove the biggest
 | Task | Unknown it removes |
 |---|---|
 | 00 | **A3**, **A1** (first look) |
-| 00b | Suite and headless `claude -p` work at all (laptop); laptop baseline for task 02 |
+| 00b | Suite and headless `claude -p` work at all (laptop); laptop baseline for task 02; first per-folder results against dev |
 | 01 | Base machine, Tailscale, sizing, A2 hello-world |
-| 02 | **A1** in full, A6, baseline |
+| 02 | **A1** in full, A6, baseline, the e2e folder list |
 | 03 | **A2 headless auth**, R1, A7 |
 | 04 | A4, A5 |
 | 05 | Fetch-by-SHA, install, timeout kill, classification |
@@ -155,7 +164,7 @@ Spike tasks (00, 00b, 01, 02, 03), task 06 and the demo (11) write short notes t
 
 ## Review responses
 
-One line per review item: round · item · disposition. Row numbers in entries before R3 refer to the classification table as it was in that round; the current numbering is in task 04.
+One line per review item: round · item · disposition. Row numbers in entries before R3 refer to the classification table as it was in that round; the current numbering is in task 04. Entries before R6 describe the Node Playwright design (`pw.json`, `npm ci`, `npm run e2e:ci`); R6 maps them to the pytest suite.
 
 - R1 · 1 (blocker, transcript) · fixed: `stream-json --verbose` → `transcript.jsonl`, `claude.json` = result event; `pw.json` is the count source (§2, §3.2, A5, tasks 03/04/05/10).
 - R1 · 2 (blocker, false-green) · fixed: task 04 table with `pw.json` authority, count mapping, rows for missing `pw.json`, no tests, mismatch, `is_error`/catch-all, usage limit, suite-run count ≠ 1.
@@ -230,3 +239,4 @@ One line per review item: round · item · disposition. Row numbers in entries b
 - R4 · 7 (old row numbers in log) · fixed: note at the top of this log.
 - R4 · 8 (estimate) · fixed: task 05 = "L, up to 2 days" with a suggested internal order; task 01 raised to M; total 7–8 working days plus 2–3 days of mostly overlapping soak time (top index, §7).
 - R5 · sweep · README now opens with a "how to use this plan" paragraph and a task index (task, title, size, depends on, milestone); §7 keeps the graph, unknowns and estimate. Task numbers, dependencies, config keys, statuses, exit codes, row numbers and file names re-checked across README and tasks 00–11.
+- R6 · target repo suite is Python/pytest, not Node Playwright · fixed: `junit.xml` (pytest `--junitxml`) + `suite.rc` replace `pw.json` as count authority; task 04 rows 8–11 redefined (missing/unparsable XML, pytest exit ≠ 0/1/5, zero executed tests incl. all-skipped, exit/count mismatch), skip and BLOCKED counts in line 1, the skip block and meta; single allowed command `bash scripts/e2e-ci.sh` (committed wrapper: fixed folders `e2e/project-skeleton e2e/homepage`, dev-URL guard, JUnit/rc paths from the runner); Node 24, pnpm via corepack, shared Python venv built once, `playwright install-deps` as root; `E2E_BASE_URL` in `project.env` (§2.1); failure-screenshot hook in `e2e/conftest.py`; leak check adds the venv path; branch `dev-v2`; A3/A4/A5/R2 reworded; demo red run and agent-driven demo edit a pytest file; tasks 00–05, 07, 09–11, PREREQUISITES and architecture docs updated.

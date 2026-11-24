@@ -6,7 +6,7 @@
 A single laptop command that the dev agent can run as a background command. It pushes, starts a run, survives disconnects, prints a compact report, and signals the outcome through its exit code.
 
 ## Scope
-- In: `laptop/cloudtest.mjs` (Node 22, no dependencies, symlinked onto `PATH` as `cloudtest`) with the commands `run <project>` and `wait <run_id>`.
+- In: `laptop/cloudtest.mjs` (Node 24, no dependencies, symlinked onto `PATH` as `cloudtest`) with the commands `run <project>` and `wait <run_id>`.
 - Out: a separate `status` command (`wait` covers it), artifact download (print the VPS run dir plus a ready-made `scp` hint), config wizard, multi-server support.
 
 ## Behaviour
