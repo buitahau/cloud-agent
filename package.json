@@ -1,0 +1,21 @@
+{
+  "name": "cloud-agent-v1",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PoC: HTTP service that pulls a repo and runs `claude -p` against it, with job polling.",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18.20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/",
+    "test:e2e": "E2E=1 node --test test/e2e.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2"
+  }
+}
