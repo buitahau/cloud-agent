@@ -31,7 +31,6 @@ function startService(extraEnv) {
       API_KEY: 'k',
       PORT: '0',
       CLAUDE_BIN: FAKE_CLAUDE,
-      CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-fake',
       ...extraEnv,
     }),
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -62,7 +61,7 @@ function startService(extraEnv) {
 test('T1 valid: logs "Claude auth OK" and "Listening on :<port>" (PORT=0); kill with SIGTERM -> exit 0', async () => {
   const s = startService({});
   try {
-    await s.waitFor(/Claude auth OK \(oauth_token, 0\.0\.0-fake \(Claude Code\), probe passed\)/);
+    await s.waitFor(/Claude auth OK \(claude\.ai, 0\.0\.0-fake \(Claude Code\), probe passed\)/);
     const m = await s.waitFor(/Listening on :(\d+)/);
     const port = Number(m[1]);
     assert.ok(port > 0);
@@ -87,7 +86,7 @@ test('T1 invalid token (FAKE_CLAUDE_AUTH=invalid) -> exits 1 within 10s, stderr 
 });
 
 test('T1 logged out (FAKE_CLAUDE_AUTH=logged_out) -> exits 1', async () => {
-  const s = startService({ FAKE_CLAUDE_AUTH: 'logged_out', CLAUDE_CODE_OAUTH_TOKEN: '' });
+  const s = startService({ FAKE_CLAUDE_AUTH: 'logged_out' });
   try {
     const { code } = await s.withTimeout(10_000);
     assert.equal(code, 1);
@@ -105,10 +104,10 @@ test('missing REPO_URL -> exits 1 with "Invalid configuration"', async () => {
   } finally { s.cleanup(); }
 });
 
-test('CLAUDE_AUTH_PROBE=false -> starts with "probe skipped" even with an invalid token', async () => {
+test('CLAUDE_AUTH_PROBE=false -> starts with "probe skipped" even with an invalid login', async () => {
   const s = startService({ FAKE_CLAUDE_AUTH: 'invalid', CLAUDE_AUTH_PROBE: 'false' });
   try {
-    await s.waitFor(/Claude auth OK \(oauth_token, .*probe skipped\)/);
+    await s.waitFor(/Claude auth OK \(claude\.ai, .*probe skipped\)/);
     await s.waitFor(/Listening on :\d+/);
     s.child.kill('SIGINT');
     const { code } = await s.withTimeout(10_000);

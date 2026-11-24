@@ -24,23 +24,27 @@ const rejectsWithStep = (p, step, re) => assert.rejects(p, (err) => {
   return true;
 });
 
-test('T1 valid: fake claude logged in + probe ok -> { ok:true, authMethod:"oauth_token", probed:true }', async () => {
-  const r = await checkClaudeAuth({ claudeBin: FAKE_CLAUDE, oauthToken: 'tok', probe: true });
-  assert.deepEqual(r, { ok: true, version: '0.0.0-fake (Claude Code)', authMethod: 'oauth_token', probed: true });
+test('T1 valid: machine subscription login + probe ok -> { ok:true, authMethod:"claude.ai", probed:true }', async () => {
+  const r = await checkClaudeAuth({ claudeBin: FAKE_CLAUDE, probe: true });
+  assert.deepEqual(r, { ok: true, version: '0.0.0-fake (Claude Code)', authMethod: 'claude.ai', probed: true });
 });
 
-test('T1 invalid token: FAKE_CLAUDE_AUTH=invalid -> ClaudeAuthError step "probe" mentioning 401/authenticate', async () => {
+test('T1 invalid login: FAKE_CLAUDE_AUTH=invalid -> ClaudeAuthError step "probe" mentioning 401/authenticate + /login hint', async () => {
   await rejectsWithStep(
-    checkClaudeAuth({ claudeBin: FAKE_CLAUDE, oauthToken: 'bad-token-value', baseEnv: { ...process.env, FAKE_CLAUDE_AUTH: 'invalid' } }),
+    checkClaudeAuth({ claudeBin: FAKE_CLAUDE, baseEnv: { ...process.env, FAKE_CLAUDE_AUTH: 'invalid' } }),
     'probe', /401|authenticate/,
   );
-  // and the token itself never shows up in the message
-  try {
-    await checkClaudeAuth({ claudeBin: FAKE_CLAUDE, oauthToken: 'bad-token-value', baseEnv: { ...process.env, FAKE_CLAUDE_AUTH: 'invalid' } });
-  } catch (err) {
-    assert.ok(!err.message.includes('bad-token-value'));
-    assert.match(err.message, /setup-token/);
-  }
+  await rejectsWithStep(
+    checkClaudeAuth({ claudeBin: FAKE_CLAUDE, baseEnv: { ...process.env, FAKE_CLAUDE_AUTH: 'invalid' } }),
+    'probe', /\/login/,
+  );
+});
+
+test('T1 non-subscription login (authMethod api_key) -> ClaudeAuthError step "status"', async () => {
+  await rejectsWithStep(
+    checkClaudeAuth({ claudeBin: FAKE_CLAUDE, probe: false, baseEnv: { ...process.env, FAKE_CLAUDE_AUTH: 'api_key' } }),
+    'status', /claude\.ai/,
+  );
 });
 
 test('T1 missing login: FAKE_CLAUDE_AUTH=logged_out -> ClaudeAuthError step "status"', async () => {
@@ -63,17 +67,17 @@ test('probe:false skips the -p call (FAKE_CLAUDE_RECORD has no -p entry)', () =>
   assert.ok(!entries.some((e) => e.argv.includes('-p')));
 }));
 
-test('probe runs in os.tmpdir() and receives CLAUDE_CODE_OAUTH_TOKEN via env', () => withRecord(async (rec, read) => {
+test('probe runs in os.tmpdir() with token/API-key env vars stripped (uses machine login)', () => withRecord(async (rec, read) => {
   await checkClaudeAuth({
-    claudeBin: FAKE_CLAUDE, oauthToken: 'sk-ant-oat01-probe', probe: true,
-    baseEnv: { ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'strip-me' },
+    claudeBin: FAKE_CLAUDE, probe: true,
+    baseEnv: { ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'strip-me', CLAUDE_CODE_OAUTH_TOKEN: 'strip-me-too' },
   });
   const probe = read().find((e) => e.argv.includes('-p'));
   assert.ok(probe);
   assert.deepEqual(probe.argv, ['-p', '--output-format', 'json', '--max-turns', '1']);
   assert.equal(probe.cwd, fs.realpathSync(os.tmpdir()));
   assert.equal(probe.stdin, 'Reply with exactly: OK');
-  assert.equal(probe.env.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-probe');
+  assert.equal(probe.env.CLAUDE_CODE_OAUTH_TOKEN, null);
   assert.equal(probe.env.ANTHROPIC_API_KEY, null);
 }));
 

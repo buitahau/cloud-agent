@@ -87,9 +87,8 @@ WORKSPACE_DIR=./workspace                        # where the repo is cloned
 GIT_SSH_KEY_PATH=~/.ssh/id_ed25519               # for SSH URLs
 # GIT_TOKEN=ghp_xxx                              # for HTTPS URLs
 
-# Claude subscription auth (headless)
-# Generate once with:  claude setup-token
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-xxx
+# Claude auth: nothing to configure. Uses the subscription already logged in on this machine
+# (`claude` → /login, once, as the OS user running the service).
 
 # Claude run options
 CLAUDE_PERMISSION_MODE=bypassPermissions         # non-interactive: no one is there to approve tool calls
@@ -101,7 +100,7 @@ PORT=8080
 API_KEY=change-me                                # protects the endpoints
 ```
 
-> **About the subscription login.** `claude -p` starts a fresh process for every prompt; there is no long-lived Claude session to keep open. What "starting the subscription at boot" means in practice: on startup the orchestrator checks that Claude is authenticated (via `CLAUDE_CODE_OAUTH_TOKEN` or an existing `~/.claude` login), and fails fast if it is not. Every job after that reuses the same credential.
+> **About the subscription login.** `claude -p` starts a fresh process for every prompt; there is no long-lived Claude session to keep open. What "starting the subscription at boot" means in practice: on startup the orchestrator checks that this machine is logged in to the Claude subscription (the `~/.claude` login of the OS user running the service, `authMethod: "claude.ai"`), and fails fast if it is not. Every job after that reuses the same login. No token or API key is configured; token/API-key env vars are stripped so the machine login is always used.
 
 ---
 
@@ -191,7 +190,7 @@ Running Claude with the repo as its working directory makes it load `.claude/age
 | Persistence | Job state in memory. | SQLite / Postgres; store full transcripts. |
 | Auth on API | One static `API_KEY` header. | Proper auth / per-user tokens. |
 | Output | Final `result` text from `--output-format json`. | Stream progress with `--output-format stream-json`; webhooks instead of polling. |
-| Subscription usage | Use the subscription OAuth token. | Check that automated, shared use fits your plan's terms; switch to an API key (`ANTHROPIC_API_KEY`) or a Team/Enterprise plan for production. |
+| Subscription usage | Use the subscription already logged in on this machine. | Check that automated, shared use fits your plan's terms; switch to an API key (`ANTHROPIC_API_KEY`) or a Team/Enterprise plan for production. |
 
 ---
 

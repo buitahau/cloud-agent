@@ -60,10 +60,10 @@ Do each step, then turn the matching `test/*.test.js` todos into real tests (rem
 |---|---|---|
 | config | `loadConfig(env, {cwd}) → Config` | pure, throws `ConfigError(problems[])`, frozen result, absolute `workspaceDir` |
 | processRunner | `runProcess(RunOptions) → Promise<RunResult>` | never rejects; `{code, signal, stdout, stderr, timedOut, aborted, truncated, spawnError, durationMs}` |
-| claudeAuth | `checkClaudeAuth({claudeBin, oauthToken, probe, run?, baseEnv?}) → {ok, version, authMethod, probed}` | throws `ClaudeAuthError(step)` with step `binary`, `status` or `probe` |
+| claudeAuth | `checkClaudeAuth({claudeBin, probe, run?, baseEnv?}) → {ok, version, authMethod, probed}` | throws `ClaudeAuthError(step)` with step `binary`, `status` or `probe` |
 | jobStore | `createJobStore({now?, genId?, logsTailLines?, logCapacity?})` | `create, get, transition, update, appendLog, toPublic, list` (all sync) |
 | gitSync | `createGitSync({repoUrl, workspaceDir, sshKeyPath?, token?, timeoutMs, gitBin?, run?, baseEnv?})` | `.sync(branch, log?, signal?) → {commit}`; throws `GitSyncError(step)` |
-| claudeRunner | `createClaudeRunner({claudeBin, permissionMode, maxTurns, timeoutMs, oauthToken?, killGraceMs?, run?, baseEnv?})` | `.run({prompt, cwd, log?, signal?}) → {outcome, result, error, meta}`; never rejects |
+| claudeRunner | `createClaudeRunner({claudeBin, permissionMode, maxTurns, timeoutMs, killGraceMs?, run?, baseEnv?})` | `.run({prompt, cwd, log?, signal?}) → {outcome, result, error, meta}`; never rejects |
 | worker | `createWorker({store, gitSync, claudeRunner, workspaceDir, logger?})` | `enqueue (sync), queueLength, currentJobId, onIdle, shutdown`; `processJob` never throws |
 | server | `createApp({config, store, worker, logger?})`, `startServer(app, port)` | no listen inside createApp; port 0 in tests |
 
@@ -122,13 +122,13 @@ Each transition appends `[job] <from> -> <to>` to the job log.
    - claude error: `claude reported an error (<subtype>): <result text>` (≤2000 chars) → `failed`
    - claude output can't be parsed: `claude exited with <code|signal>; unparseable output: <last stderr line>` → `failed`
    - anything unexpected: `Internal error: <message>` → `failed` (stack goes to `logger.error`)
-3. **Success requires `exit code 0 AND parsed.is_error === false`.** Verified on claude 2.1.x: a bad OAuth
-   token gives `subtype: "success"`, `is_error: true`, exit 1. Never decide success from `subtype` alone.
+3. **Success requires `exit code 0 AND parsed.is_error === false`.** Verified on claude 2.1.x: a bad login
+   gives `subtype: "success"`, `is_error: true`, exit 1. Never decide success from `subtype` alone.
 4. **The worker loop survives everything.** A bug in one job must not stop later jobs or crash the process
    (T9). `index.js` logs `unhandledRejection` and does not exit.
 5. **HTTP errors are always JSON `{ error }`:** 400 validation or bad JSON, 401 bad key, 404 unknown id or route,
    413 body too large, 500 internal.
-6. **Secrets** (API_KEY, GIT_TOKEN, CLAUDE_CODE_OAUTH_TOKEN) never appear in logs, errors, argv, or
+6. **Secrets** (API_KEY, GIT_TOKEN) never appear in logs, errors, argv, or
    `.git/config`. `auth status` stdout is never logged because it contains the account email and org.
 
 ---
@@ -155,7 +155,8 @@ Each transition appends `[job] <from> -> <to>` to the job log.
 - `--max-turns` works on 2.x even though `--help` doesn't list it.
 - Child env is `process.env` minus `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` (they would move billing off
   the subscription), and `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` (set when the service runs inside a Claude
-  Code session). `CLAUDE_CODE_OAUTH_TOKEN` is added when configured.
+  Code session), and `CLAUDE_CODE_OAUTH_TOKEN` (would override the machine login). Auth always comes from
+  the subscription login in `~/.claude` of the OS user running the service.
 - JSON parsing: `JSON.parse(stdout.trim())`. If that fails, take the last stdout line that starts with `{`
   and parses to `type === "result"`. If nothing matches, treat the output as unparseable.
 
@@ -173,10 +174,11 @@ Each transition appends `[job] <from> -> <to>` to the job log.
   is already in `result`.
 
 ### Startup auth check (T1)
-- `claude auth status --json` alone isn't enough. With a bogus `CLAUDE_CODE_OAUTH_TOKEN` it still reports
-  `loggedIn: true` (verified). So by default we also run a 1-turn probe (`CLAUDE_AUTH_PROBE=true`):
+- Auth = the Claude subscription already logged in on this machine (no token in `.env`).
+  `claude auth status --json` must report `loggedIn: true` **and** `authMethod: "claude.ai"`, else step `status` fails.
+- `auth status` alone isn't enough: it only checks stored credentials exist, not that they still work. So by default we also run a 1-turn probe (`CLAUDE_AUTH_PROBE=true`):
   `claude -p --output-format json --max-turns 1` with prompt `Reply with exactly: OK`, run in `os.tmpdir()`.
-  It costs a few cents per boot. Set `CLAUDE_AUTH_PROBE=false` to skip it, but then T1's invalid-token case
+  It costs a few cents per boot. Set `CLAUDE_AUTH_PROBE=false` to skip it, but then T1's invalid-login case
   is only caught by the first job.
 - Success log line, which T1 checks: `Claude auth OK (...)`. On failure: `ClaudeAuthError` message on stderr, exit 1.
 

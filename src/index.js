@@ -19,12 +19,12 @@ import { createApp, startServer } from './server.js';
  *     console.log('Config:', JSON.stringify(redactConfig(config)))
  *  2. if process.getuid?.() === 0 && config.claudePermissionMode === 'bypassPermissions':
  *       console.warn — claude refuses bypassPermissions as root; run as a non-root user.
- *  3. auth = await checkClaudeAuth({ claudeBin, oauthToken: config.claudeOauthToken, probe: config.claudeAuthProbe })
+ *  3. auth = await checkClaudeAuth({ claudeBin, probe: config.claudeAuthProbe })
  *       ClaudeAuthError -> console.error(err.message); process.exit(1)
  *     console.log(`Claude auth OK (${auth.authMethod}, ${auth.version}${auth.probed ? ', probe passed' : ', probe skipped'})`)
  *  4. store  = createJobStore({ logsTailLines: config.logsTailLines })
  *     gitSync = createGitSync({ repoUrl, workspaceDir, sshKeyPath: gitSshKeyPath, token: gitToken, timeoutMs: gitTimeoutMs })
- *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs, oauthToken })
+ *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs })
  *     worker = createWorker({ store, gitSync, claudeRunner: runner, workspaceDir })
  *     app    = createApp({ config, store, worker })
  *  5. server = await startServer(app, config.port)
@@ -67,7 +67,6 @@ export async function main() {
   try {
     auth = await checkClaudeAuth({
       claudeBin: config.claudeBin,
-      oauthToken: config.claudeOauthToken,
       probe: config.claudeAuthProbe,
     });
   } catch (err) {
@@ -93,7 +92,6 @@ export async function main() {
     permissionMode: config.claudePermissionMode,
     maxTurns: config.claudeMaxTurns,
     timeoutMs: config.jobTimeoutMs,
-    oauthToken: config.claudeOauthToken,
   });
   const worker = createWorker({ store, gitSync, claudeRunner: runner, workspaceDir: config.workspaceDir });
   const app = createApp({ config, store, worker });

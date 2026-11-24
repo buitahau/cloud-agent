@@ -1,9 +1,12 @@
 // src/claudeAuth.js
 // Startup authentication check (spec §4 note, test T1). Fail fast if Claude can't authenticate.
 //
-// Why two steps: `claude auth status --json` only checks that SOME credential is present — with a bogus
-// CLAUDE_CODE_OAUTH_TOKEN it still reports loggedIn: true (verified on claude 2.1.x). Only a real request
-// proves the token works, so by default we also run a 1-turn probe (CLAUDE_AUTH_PROBE=true). A bad token
+// Auth model: the service uses the Claude subscription already logged in on this machine (`claude` → /login),
+// stored in ~/.claude of the OS user running the service. No token is configured; token/API-key env vars are
+// stripped (see buildClaudeEnv) so that login is always what claude uses.
+//
+// Why a probe too: `claude auth status --json` only checks that stored credentials exist, not that they still
+// work (e.g. a revoked session). By default we also run a 1-turn probe (CLAUDE_AUTH_PROBE=true). A bad login
 // makes the probe exit 1 with JSON { is_error: true, api_error_status: 401, result: "Failed to authenticate..." }.
 
 import os from 'node:os';
@@ -16,7 +19,7 @@ export const AUTH_STEP_TIMEOUT_MS = 90_000;
 export class ClaudeAuthError extends Error {
   /**
    * @param {'binary'|'status'|'probe'} step
-   * @param {string} message  must be actionable, e.g. include "run `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN"
+   * @param {string} message  must be actionable, e.g. include "log in with `claude` (/login) as this user"
    */
   constructor(step, message) {
     super(`Claude auth check failed at ${step}: ${message}`);
@@ -29,14 +32,14 @@ export class ClaudeAuthError extends Error {
  * @typedef {Object} AuthCheckResult
  * @property {true}   ok
  * @property {string} version      `claude --version` stdout trimmed, e.g. "2.1.331 (Claude Code)"
- * @property {string} authMethod   from `auth status --json` (.authMethod), e.g. "oauth_token" | "claude.ai"
+ * @property {string} authMethod   from `auth status --json` (.authMethod), always "claude.ai" (subscription login)
  * @property {boolean} probed      whether the live probe ran
  */
 
 /**
- * Steps (each via `run`, env = buildClaudeEnv(baseEnv, oauthToken), timeoutMs = AUTH_STEP_TIMEOUT_MS):
+ * Steps (each via `run`, env = buildClaudeEnv(baseEnv), timeoutMs = AUTH_STEP_TIMEOUT_MS):
  *  1. binary:  `<claudeBin> --version`               spawnError/code!=0 -> ClaudeAuthError('binary', `cannot run ${claudeBin}: ...`)
- *  2. status:  `<claudeBin> auth status --json`      parse stdout JSON; require .loggedIn === true
+ *  2. status:  `<claudeBin> auth status --json`      parse stdout JSON; require .loggedIn === true and .authMethod === "claude.ai"
  *                                                    (exit code is 1 when logged out) -> else ClaudeAuthError('status', ...)
  *  3. probe (only if opts.probe): `<claudeBin> -p --output-format json --max-turns 1`, stdin AUTH_PROBE_PROMPT,
  *     cwd = os.tmpdir() (so no repo .claude/ settings or hooks are loaded).
@@ -46,7 +49,6 @@ export class ClaudeAuthError extends Error {
  *
  * @param {Object} opts
  * @param {string}      opts.claudeBin
- * @param {string|null} [opts.oauthToken]
  * @param {boolean}     [opts.probe=true]
  * @param {import('./lib/processRunner.js').RunFn} [opts.run=runProcess]
  * @param {NodeJS.ProcessEnv} [opts.baseEnv=process.env]
@@ -59,9 +61,9 @@ const lastLine = (text) => {
 };
 
 export async function checkClaudeAuth(opts) {
-  const { claudeBin, oauthToken = null, probe = true, run = runProcess, baseEnv = process.env } = opts;
-  const env = buildClaudeEnv(baseEnv, oauthToken);
-  const hint = 'run `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN (or log in with `claude` on this host)';
+  const { claudeBin, probe = true, run = runProcess, baseEnv = process.env } = opts;
+  const env = buildClaudeEnv(baseEnv);
+  const hint = 'log in to your Claude subscription on this machine: run `claude`, then /login, as the same OS user that runs this service';
 
   // 1. binary
   const v = await run({ cmd: claudeBin, args: ['--version'], env, timeoutMs: AUTH_STEP_TIMEOUT_MS });
@@ -84,6 +86,9 @@ export async function checkClaudeAuth(opts) {
     throw new ClaudeAuthError('status', `\`claude auth status\` reports ${why}; ${hint}`);
   }
   const authMethod = typeof status.authMethod === 'string' ? status.authMethod : 'unknown';
+  if (authMethod !== 'claude.ai') {
+    throw new ClaudeAuthError('status', `expected a Claude subscription login (claude.ai) but found "${authMethod}"; ${hint}`);
+  }
 
   // 3. live probe
   if (probe) {

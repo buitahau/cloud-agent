@@ -34,7 +34,6 @@ test('minimal valid env (REPO_URL + API_KEY) -> defaults applied', () => {
   assert.equal(c.claudeAuthProbe, true);
   assert.equal(c.gitSshKeyPath, null);
   assert.equal(c.gitToken, null);
-  assert.equal(c.claudeOauthToken, null);
   assert.equal(c.workspaceDir, path.resolve(cwd, './workspace'));
   assert.ok(Object.isFrozen(c));
 });
@@ -99,11 +98,10 @@ test('CLAUDE_AUTH_PROBE parses true/false/1/0/yes/no; other values rejected', ()
   assert.match(problemsOf({ ...BASE, CLAUDE_AUTH_PROBE: 'maybe' })[0], /CLAUDE_AUTH_PROBE/);
 });
 
-test('ConfigError message never contains API_KEY / GIT_TOKEN / CLAUDE_CODE_OAUTH_TOKEN values', () => {
+test('ConfigError message never contains API_KEY / GIT_TOKEN values', () => {
   const env = {
     API_KEY: 'secret-api-key-123',
     GIT_TOKEN: 'ghp_secret_token_456',
-    CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-secret-789',
     PORT: 'nope',
     CLAUDE_MAX_TURNS: 'x',
   };
@@ -112,21 +110,20 @@ test('ConfigError message never contains API_KEY / GIT_TOKEN / CLAUDE_CODE_OAUTH
     assert.fail('expected ConfigError');
   } catch (err) {
     assert.ok(err instanceof ConfigError);
-    for (const secret of [env.API_KEY, env.GIT_TOKEN, env.CLAUDE_CODE_OAUTH_TOKEN]) {
+    for (const secret of [env.API_KEY, env.GIT_TOKEN]) {
       assert.ok(!err.message.includes(secret));
     }
   }
 });
 
 test('redactConfig masks secrets', () => {
-  const c = loadConfig({ ...BASE, GIT_TOKEN: 'ghp_x', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-y' }, { cwd });
+  const c = loadConfig({ ...BASE, GIT_TOKEN: 'ghp_x' }, { cwd });
   const r = redactConfig(c);
   assert.equal(r.apiKey, '***');
   assert.equal(r.gitToken, '***');
-  assert.equal(r.claudeOauthToken, '***');
   assert.equal(r.repoUrl, c.repoUrl);
   const json = JSON.stringify(r);
-  for (const s of ['ghp_x', 'sk-ant-y']) assert.ok(!json.includes(s));
+  for (const s of ['ghp_x']) assert.ok(!json.includes(s));
   assert.equal(redactConfig(loadConfig(BASE, { cwd })).gitToken, null);
 });
 

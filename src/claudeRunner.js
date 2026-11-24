@@ -10,6 +10,7 @@ export const STRIPPED_ENV_VARS = Object.freeze([
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDECODE',             // set when the service itself is launched from a Claude Code session; makes
   'CLAUDE_CODE_ENTRYPOINT', //   the child think it's nested
+  'CLAUDE_CODE_OAUTH_TOKEN', // would override the subscription login stored in ~/.claude on this machine
 ]);
 
 /**
@@ -41,7 +42,6 @@ export const STRIPPED_ENV_VARS = Object.freeze([
  * @property {string}      permissionMode
  * @property {number}      maxTurns
  * @property {number}      timeoutMs              JOB_TIMEOUT_SECONDS * 1000; applies to the claude step only
- * @property {string|null} [oauthToken]           exported to the child as CLAUDE_CODE_OAUTH_TOKEN when set
  * @property {number}      [killGraceMs]          passed to run (tests use small values)
  * @property {import('./lib/processRunner.js').RunFn} [run=runProcess]
  * @property {NodeJS.ProcessEnv} [baseEnv=process.env]
@@ -75,7 +75,6 @@ export function createClaudeRunner(opts) {
     permissionMode,
     maxTurns,
     timeoutMs,
-    oauthToken = null,
     killGraceMs,
     run = runProcess,
     baseEnv = process.env,
@@ -91,7 +90,7 @@ export function createClaudeRunner(opts) {
           cmd: claudeBin,
           args,
           cwd,
-          env: buildClaudeEnv(baseEnv, oauthToken),
+          env: buildClaudeEnv(baseEnv),
           stdin: prompt,
           timeoutMs,
           killGraceMs,
@@ -133,16 +132,15 @@ export function buildClaudeArgs(p) {
 }
 
 /**
- * Child env: copy of baseEnv minus STRIPPED_ENV_VARS; if oauthToken set, CLAUDE_CODE_OAUTH_TOKEN = oauthToken.
+ * Child env: copy of baseEnv minus STRIPPED_ENV_VARS, so claude always authenticates with the
+ * subscription login already stored in ~/.claude for the user running this service (HOME must point there).
  * Never mutates baseEnv.
  * @param {NodeJS.ProcessEnv} baseEnv
- * @param {string|null|undefined} oauthToken
  * @returns {NodeJS.ProcessEnv}
  */
-export function buildClaudeEnv(baseEnv, oauthToken) {
+export function buildClaudeEnv(baseEnv) {
   const env = { ...baseEnv };
   for (const k of STRIPPED_ENV_VARS) delete env[k];
-  if (oauthToken) env.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
   return env;
 }
 

@@ -25,7 +25,6 @@ export const PERMISSION_MODES = Object.freeze([
  * @property {string}      workspaceDir         WORKSPACE_DIR resolved to an ABSOLUTE path (default "./workspace", resolved against cwd)
  * @property {string|null} gitSshKeyPath        GIT_SSH_KEY_PATH with leading "~" expanded to os.homedir(); null if unset/empty
  * @property {string|null} gitToken             GIT_TOKEN; null if unset/empty
- * @property {string|null} claudeOauthToken     CLAUDE_CODE_OAUTH_TOKEN; null if unset/empty (then an existing ~/.claude login must work)
  * @property {string}      claudeBin            CLAUDE_BIN (default "claude")
  * @property {string}      claudePermissionMode CLAUDE_PERMISSION_MODE (default "bypassPermissions"), one of PERMISSION_MODES
  * @property {number}      claudeMaxTurns       CLAUDE_MAX_TURNS (default 50), integer >= 1
@@ -131,7 +130,6 @@ export function loadConfig(env, opts = {}) {
     workspaceDir,
     gitSshKeyPath,
     gitToken: get('GIT_TOKEN'),
-    claudeOauthToken: get('CLAUDE_CODE_OAUTH_TOKEN'),
     claudeBin: get('CLAUDE_BIN') ?? 'claude',
     claudePermissionMode,
     claudeMaxTurns,
@@ -157,7 +155,7 @@ export function expandHome(p, home = os.homedir()) {
 }
 
 /**
- * Copy of the config safe to log: gitToken, claudeOauthToken, apiKey replaced by "***" (or null if unset).
+ * Copy of the config safe to log: gitToken, apiKey replaced by "***" (or null if unset).
  * @param {Config} config
  * @returns {Record<string, unknown>}
  */
@@ -166,7 +164,6 @@ export function redactConfig(config) {
   return {
     ...config,
     gitToken: mask(config.gitToken),
-    claudeOauthToken: mask(config.claudeOauthToken),
     apiKey: mask(config.apiKey),
   };
 }

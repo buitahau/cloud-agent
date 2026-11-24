@@ -14,22 +14,25 @@ Requirements: Node ≥ 18.20, git ≥ 2.31, Claude Code CLI (`claude`) on `PATH`
 ```bash
 npm install
 
-# 1. Create a long-lived subscription token (interactive, once):
-claude setup-token          # prints sk-ant-oat01-...
+# 1. Make sure this machine is logged in to your Claude subscription (once, interactive):
+claude auth status          # should show "authMethod": "claude.ai"
+# if not:  claude  → /login
 
 # 2. Configure
 cp .env.example .env
 #    - REPO_URL / REPO_BRANCH / WORKSPACE_DIR
 #    - GIT_SSH_KEY_PATH (ssh URL) or GIT_TOKEN (https URL)
-#    - CLAUDE_CODE_OAUTH_TOKEN=<token from step 1>
 #    - API_KEY=<any secret; callers send it as x-api-key>
 ```
 
-Do not set `ANTHROPIC_API_KEY` for this; it is stripped from claude's environment anyway so billing stays on
-the subscription.
+No Claude token or API key is configured. The service uses the subscription login stored in `~/.claude` of
+the OS user that runs it, so start it as **that same user** (same `HOME`). `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are stripped from claude's environment, so the machine
+login is always what gets used and billed.
 
-At startup the service checks `claude --version`, `claude auth status`, and (with `CLAUDE_AUTH_PROBE=true`,
-the default) runs a 1-turn probe prompt to prove the token really works. It costs a little usage per boot;
+At startup the service checks `claude --version`, `claude auth status` (must be logged in with
+`authMethod: "claude.ai"`), and (with `CLAUDE_AUTH_PROBE=true`,
+the default) runs a 1-turn probe prompt to prove the login really works. It costs a little usage per boot;
 set `CLAUDE_AUTH_PROBE=false` to skip it.
 
 ## Run

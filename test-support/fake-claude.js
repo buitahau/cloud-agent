@@ -5,8 +5,9 @@
 //
 // Supported invocations:
 //   fake-claude --version                      -> "0.0.0-fake (Claude Code)", exit 0
-//   fake-claude auth status --json             -> {"loggedIn":true,"authMethod":"oauth_token",...}, exit 0
+//   fake-claude auth status --json             -> {"loggedIn":true,"authMethod":"claude.ai",...}, exit 0
 //                                                 FAKE_CLAUDE_AUTH=logged_out -> loggedIn:false, exit 1
+//                                                 FAKE_CLAUDE_AUTH=api_key -> loggedIn:true, authMethod "api_key", exit 0
 //   fake-claude -p [flags...]  (prompt on stdin, or as last positional arg)
 //
 // -p behaviour is chosen by a directive in the prompt "[[fake:<mode>]]" or else env FAKE_CLAUDE_MODE (default "success"):
@@ -154,7 +155,8 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'oauth_token', apiProvider: 'firstParty' }, null, 2) + '\n');
+    const authMethod = process.env.FAKE_CLAUDE_AUTH === 'api_key' ? 'api_key' : 'claude.ai';
+    process.stdout.write(JSON.stringify({ loggedIn: true, authMethod, apiProvider: 'firstParty' }, null, 2) + '\n');
     return;
   }
   if (argv.includes('-p') || argv.includes('--print')) {

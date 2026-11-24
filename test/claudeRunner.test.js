@@ -28,16 +28,15 @@ test('buildClaudeArgs exact vector (prompt NOT in argv)', () => {
     ['-p', '--output-format', 'json', '--permission-mode', 'bypassPermissions', '--max-turns', '50']);
 });
 
-test('buildClaudeEnv strips ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN/CLAUDECODE/CLAUDE_CODE_ENTRYPOINT, sets token, no mutation', () => {
+test('buildClaudeEnv strips API key / auth token / OAuth token / nesting vars so the machine login is used; no mutation', () => {
   const base = {
-    PATH: '/bin', ANTHROPIC_API_KEY: 'a', ANTHROPIC_AUTH_TOKEN: 'b', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP: 'x',
+    PATH: '/bin', ANTHROPIC_API_KEY: 'a', ANTHROPIC_AUTH_TOKEN: 'b', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli',
+    CLAUDE_CODE_OAUTH_TOKEN: 'pre', KEEP: 'x',
   };
   const snapshot = { ...base };
-  const env = buildClaudeEnv(base, 'tok');
-  assert.deepEqual(env, { PATH: '/bin', KEEP: 'x', CLAUDE_CODE_OAUTH_TOKEN: 'tok' });
+  const env = buildClaudeEnv(base);
+  assert.deepEqual(env, { PATH: '/bin', KEEP: 'x' });
   assert.deepEqual(base, snapshot);
-  assert.equal(buildClaudeEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'pre' }, null).CLAUDE_CODE_OAUTH_TOKEN, 'pre');
-  assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in buildClaudeEnv({}, null), false);
 });
 
 test('parseClaudeJson: single object; warning lines before JSON; garbage -> null; non-result object -> null', () => {
@@ -148,7 +147,7 @@ test('T10 via fake: [[fake:sleep=30]] with timeoutMs 500 -> outcome timeout, gra
   }
 });
 
-test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD shows flags + token + stripped env', async () => {
+test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD shows flags + stripped env', async () => {
   const dir = tmpdir();
   const rec = path.join(dir, 'record.jsonl');
   const work = fs.realpathSync(fs.mkdtempSync(path.join(dir, 'ws-')));
@@ -157,8 +156,7 @@ test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD show
       ...baseOpts,
       permissionMode: 'acceptEdits',
       maxTurns: 7,
-      oauthToken: 'sk-ant-oat01-test',
-      baseEnv: { ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'should-go', CLAUDECODE: '1' },
+      baseEnv: { ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'should-go', CLAUDECODE: '1', CLAUDE_CODE_OAUTH_TOKEN: 'should-go' },
     });
     const out = await runner.run({ prompt: '-starts with dash [[fake:pwd]]', cwd: work });
     assert.equal(out.outcome, 'succeeded');
@@ -167,7 +165,7 @@ test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD show
     assert.deepEqual(entry.argv, ['-p', '--output-format', 'json', '--permission-mode', 'acceptEdits', '--max-turns', '7']);
     assert.equal(entry.stdin, '-starts with dash [[fake:pwd]]');
     assert.equal(entry.cwd, work);
-    assert.deepEqual(entry.env, { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test', ANTHROPIC_API_KEY: null, CLAUDECODE: null });
+    assert.deepEqual(entry.env, { CLAUDE_CODE_OAUTH_TOKEN: null, ANTHROPIC_API_KEY: null, CLAUDECODE: null });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
