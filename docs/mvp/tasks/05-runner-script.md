@@ -22,41 +22,45 @@ Call, run directory, `meta.json` fields and exit codes: see [task 04, Runner con
 5. Merge `{status: "running", started_at, claude_version}`. Install `trap on_exit EXIT` and `trap 'exit 129' HUP; trap 'exit 143' TERM INT` (so a signal also runs `on_exit`). `on_exit`, in this order: `kill_run_procs` (step 10), `git worktree remove --force wt` (falling back to `rm -rf` + `git worktree prune`), and, if no final status was written, merge `error / runner crashed` (task 04 row O1).
 6. Fetch, in `/var/lib/cloudtest/repo`: `run env GIT_ASKPASS=$here/askpass.sh GIT_TERMINAL_PROMPT=0 timeout 120 git -c credential.helper= -c gc.auto=0 -c maintenance.auto=false fetch origin <sha>`. Failure → task 04 row 1. Record `fetch_ms`. The token is never in any process environment.
 7. Worktree: `git worktree add --detach <run_dir>/wt <sha>`. Leave `node_modules` uncached for the MVP.
-8. Install, with the clean env `ce` from step 9: `run "${ce[@]}" timeout 10m npm ci`, then `run "${ce[@]}" timeout 5m npx playwright install chromium` (no `--with-deps`, no root; a no-op when the browser version is current). Failure → row 2. Record `install_ms`.
+8. Install, with the clean env `ce` from step 9: `run "${ce[@]}" timeout 10m pnpm install --frozen-lockfile`, then the venv check `run "${ce[@]}" timeout 1m "$E2E_VENV/bin/python" -c 'import playwright, pytest, yaml, axe_playwright_python'`, then `run "${ce[@]}" timeout 5m "$E2E_VENV/bin/playwright" install chromium` (no `--with-deps`, no root; a no-op when the browser version is current). `$E2E_VENV` is the fixed path `/var/lib/cloudtest/venv-e2e`: the venv is shared, built once in task 01, and the runner never `pip install`s (the target repo pins no Python versions). Failure → row 2 with the step name. Record `install_ms` (all three steps).
 9. Run claude. The command is built as arrays in the runner; the inner `bash -c` only loads the secrets and `exec`s its arguments:
    ```
    ms=$((TIMEOUT_MIN*60000))
    ce=(env -i -C "$run_dir/wt" HOME=/home/cloudtest PATH=/usr/local/bin:/usr/bin:/bin CI=1
        DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
-       BASH_DEFAULT_TIMEOUT_MS=$ms BASH_MAX_TIMEOUT_MS=$ms PLAYWRIGHT_JSON_OUTPUT_NAME="$run_dir/pw.json")
+       BASH_DEFAULT_TIMEOUT_MS=$ms BASH_MAX_TIMEOUT_MS=$ms COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+       E2E_VENV=/var/lib/cloudtest/venv-e2e E2E_JUNIT="$run_dir/junit.xml" E2E_RC_FILE="$run_dir/suite.rc")
    wrap=(bash -c 'set -a; . /etc/cloudtest/project.env
          if [ -r /etc/cloudtest/claude-token ]; then CLAUDE_CODE_OAUTH_TOKEN=$(cat /etc/cloudtest/claude-token); fi
          set +a; exec "$@"' _)
    cmd=(timeout --kill-after=30s "${TIMEOUT_MIN}m" claude -p "$(cat "$here/prompt.md")"
         --output-format stream-json --verbose --model "$MODEL" --max-turns "$MAX_TURNS"
-        --tools "Read,Grep,Glob,Bash" --allowedTools "Bash(npm run e2e:ci)"
+        --tools "Read,Grep,Glob,Bash" --allowedTools "Bash(bash scripts/e2e-ci.sh)"
         --disallowedTools "Read(//etc/cloudtest/**)" "Read(~/.claude/**)"
         --permission-mode dontAsk --strict-mcp-config --no-session-persistence)
         # plus any flag task 03 settled on (e.g. --setting-sources user); its findings are the reference
    run "${ce[@]}" "${wrap[@]}" "${cmd[@]}" </dev/null >"$run_dir/transcript.jsonl" 2>"$run_dir/claude.err"; rc=$?
    ```
-   `env -i` guarantees there is no `ANTHROPIC_API_KEY` and no GitHub token; `-C` keeps the runner's own cwd outside `wt/` (step 10 kills by that path); `set -a; .` loads `project.env` without word-splitting; the `BASH_*_TIMEOUT_MS` values and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` stop Claude Code's own Bash tool from cutting off or backgrounding the suite (task 03). There is no `setsid`: stdin is `/dev/null` and none of the three call paths has a TTY. Record `claude_ms`; row 3 uses it.
-10. `kill_run_procs` (called right after `wait`, and again from `on_exit`): list every `cloudtest` process other than `$$` whose cwd or command line is under `$run_dir/wt`, or whose command line contains `ms-playwright`; write the list to `run.log`; `kill -KILL` them; repeat once after 1 s. Claude's Bash tool starts commands in their own session, so a session kill would miss the Playwright tree; every descendant carries the worktree path in its cwd or command line. This is safe because runs are serial. If AC 3 still shows leaks, switch to `systemd-run --user --scope` per run (cgroup kill).
-11. Classify: extract `claude.json` (`jq -c 'select(.type=="result")'`), then `node $here/classify.mjs --transcript … --stderr claude.err --pw pw.json --claude-exit $rc --claude-ms … --timeout-min $TIMEOUT_MIN --report report.md`. It applies task 04 rows 3–13, writes `report.md` (task 04 step 6 rules), and prints one JSON object (`status`, `result`, `reason`, `passed`, `failed`, `num_turns`, `duration_ms`, `agent_line_ok`) that the runner merges into `meta.json` with the timings. For rows 1–2 the runner writes `report.md` (line 1 only) and the meta itself.
-12. Copy `wt/test-results/` to `<run_dir>/artifacts/test-results/` if it exists. Exit with the code from the runner contract; `on_exit` removes the worktree.
-13. Fixtures: `vps/fixtures/<row>-<slug>/` holds `transcript.jsonl`, `claude.err`, `pw.json` (if any), `args.json` (exit, ms, timeout) and `expected.json` (`status`, `result`, `reason`), one directory per row 3–13. Rows 4, 5, 12, 13 use the real transcripts from tasks 03–04; the rest are hand-edited copies. `vps/classify.test.mjs` runs `classify.mjs` on each and compares.
+   `env -i` guarantees there is no `ANTHROPIC_API_KEY` and no GitHub token; `E2E_BASE_URL` comes only from `project.env` (README §2.1); `-C` keeps the runner's own cwd outside `wt/` (step 10 kills by that path); `set -a; .` loads `project.env` without word-splitting; the `BASH_*_TIMEOUT_MS` values and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` stop Claude Code's own Bash tool from cutting off or backgrounding the suite (task 03). There is no `setsid`: stdin is `/dev/null` and none of the three call paths has a TTY. Record `claude_ms`; row 3 uses it.
+10. `kill_run_procs` (called right after `wait`, and again from `on_exit`): list every `cloudtest` process other than `$$` whose cwd or command line is under `$run_dir/wt`, or whose command line contains `ms-playwright` (the Chromium cache, the same for Python Playwright) or `$E2E_VENV/` (pytest and the Playwright Python driver); write the list to `run.log`; `kill -KILL` them; repeat once after 1 s. Claude's Bash tool starts commands in their own session, so a session kill would miss the pytest/Playwright tree; every descendant carries the worktree path in its cwd, or the browser cache or venv path in its command line. This is safe because runs are serial. If AC 3 still shows leaks, switch to `systemd-run --user --scope` per run (cgroup kill).
+11. Classify: extract `claude.json` (`jq -c 'select(.type=="result")'`), then `node $here/classify.mjs --transcript … --stderr claude.err --junit junit.xml --suite-rc suite.rc --claude-exit $rc --claude-ms … --timeout-min $TIMEOUT_MIN --report report.md`. It applies task 04 rows 3–13, writes `report.md` (task 04 step 6 rules), and prints one JSON object (`status`, `result`, `reason`, `passed`, `failed`, `skipped`, `blocked`, `suite_exit`, `tests_ms`, `num_turns`, `duration_ms`, `agent_line_ok`) that the runner merges into `meta.json` with the timings. For rows 1–2 the runner writes `report.md` (line 1 only) and the meta itself.
+12. Copy `wt/test-results/` and every `wt/e2e/*/screenshots/` to `<run_dir>/artifacts/`, keeping paths relative to `wt/` (`cd wt && cp -r --parents …`), if they exist. Exit with the code from the runner contract; `on_exit` removes the worktree.
+13. Fixtures: `vps/fixtures/<row>-<slug>/` holds `transcript.jsonl`, `claude.err`, `junit.xml` and `suite.rc` (if any), `args.json` (exit, ms, timeout) and `expected.json` (`status`, `result`, `reason`), one directory per row 3–13. Rows 4, 5, 12, 13 use the real transcripts from tasks 03–04; the rest are hand-edited copies. Row 10's fixture is an all-skipped `junit.xml` (BLOCKED reasons, `rc` 0), so the "green made of skips" case is pinned; the row 13 fixture includes one `<testcase>` with both `<failure>` and `<error>`, which must count once (task 04 step 4). `vps/classify.test.mjs` runs `classify.mjs` on each and compares.
 
-**Leak check** (used by ACs 3 and 6, task 08 and README §3.5), run from an interactive shell on the VPS (as `cloudtest`) or as root, right after the run ends. Do not send it as one `ssh host '…'` line as `cloudtest`: the remote `bash -c` then has the pattern in its own command line and `pgrep` reports it as a leak. `ls -l /proc/*/cwd 2>/dev/null | grep -c "<run_dir>/wt"` prints 0, and `pgrep -u cloudtest -f "ms-playwright|<run_dir>/wt"` prints nothing.
+**Leak check** (used by ACs 3 and 6, task 08 and README §3.5), run from an interactive shell on the VPS (as `cloudtest`) or as root, right after the run ends. Do not send it as one `ssh host '…'` line as `cloudtest`: the remote `bash -c` then has the pattern in its own command line and `pgrep` reports it as a leak. `ls -l /proc/*/cwd 2>/dev/null | grep -c "<run_dir>/wt"` prints 0, and `pgrep -u cloudtest -f "ms-playwright|venv-e2e/|<run_dir>/wt"` prints nothing.
 
-**Timeout drill** (used by AC 3 and README §3.5): set `TIMEOUT_MIN=2` in `/etc/cloudtest/config.env` (no restart needed, README §2.1), run a throwaway commit that adds this spec, then restore the file:
+**Timeout drill** (used by AC 3 and README §3.5): set `TIMEOUT_MIN=2` in `/etc/cloudtest/config.env` (no restart needed, README §2.1), run a throwaway commit that adds this test to a folder the wrapper runs, e.g. `e2e/project-skeleton/test_zz_hang.py`, then restore the file:
 ```
-test('hang', async ({ page }) => { test.setTimeout(15 * 60_000); await page.goto(process.env.BASE_URL); await page.waitForTimeout(10 * 60_000); });
+def test_hang(pw, base_url):
+    page = pw.chromium.launch().new_page()
+    page.goto(base_url + "/")
+    page.wait_for_timeout(10 * 60_000)
 ```
-`test.setTimeout` overrides the per-test timeout. If the Playwright config sets a `globalTimeout` under 2 min in CI mode, raise it in the same throwaway commit.
+It uses the shared `pw` fixture (`e2e/conftest.py`) and the folder's `base_url`. pytest has no per-test timeout unless a plugin such as `pytest-timeout` is installed; the shared venv has none (task 01).
 
 ## Acceptance criteria
 - [ ] On the laptop, `node vps/classify.test.mjs` prints `11/11 rows ok`.
-- [ ] Running `run-once.sh` by hand on a green SHA gives status `done`, result `pass`, exit 0. On the red SHA it gives `fail`, exit 1, and every `screenshot:` path in `report.md` passes `test -f <run_dir>/artifacts/<path>`.
+- [ ] Running `run-once.sh` by hand on a green SHA gives status `done`, result `pass`, exit 0. On the red SHA (a broken assertion in a `page` test, task 04 step 7) it gives `fail`, exit 1, `junit.xml` and `suite.rc` (= 1) are in the run dir, at least one `screenshot:` line is not `none`, and every `screenshot:` path other than `none` in `report.md` passes `test -f <run_dir>/artifacts/<path>`.
 - [ ] Timeout drill (above): status `timeout`, exit 3, `run.log` lists the Chromium processes `kill_run_procs` found, and the leak check is clean right after the script exits.
 - [ ] With auth broken as chosen in task 03 (credentials file moved aside, or an invalid token): status `error`, reason `claude auth failed`, exit 2.
 - [ ] With a nonexistent SHA: status `error`, reason starting `fetch failed`, exit 2. `kill -9` of the runner's claude mid-run gives `error / claude failed: killed (signal 9)` (row 6), not `timeout` or `running`.

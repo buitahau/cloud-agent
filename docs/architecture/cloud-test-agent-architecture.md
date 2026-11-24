@@ -14,7 +14,7 @@ Offload E2E test runs from the laptop to a VPS so the laptop stays free for othe
 
 - A **dashboard** to create projects (GitHub repo, GitHub token, env vars, timeout).
 - A **local tester agent** (Claude Code on the laptop) triggers a run.
-- The **VPS** pulls the changes, spawns a Claude agent that runs the E2E tests defined in the repo (Playwright), and returns the result.
+- The **VPS** pulls the changes, spawns a Claude agent that runs the E2E tests defined in the repo (Playwright; for the MVP target repo, Python Playwright + pytest), and returns the result.
 
 Constraints: one user (me), Playwright, no database needed by the tests, tests run against the **dev environment**, Claude Code is already logged in on the VPS.
 
@@ -49,7 +49,7 @@ VPS (Docker Compose or systemd)
   └─ Worker   : one run at a time
         lock → git fetch (token) → worktree@sha
              → claude -p "<run prompt>"  (headless, read-only tools)
-                  Claude reads repo docs, installs deps, runs Playwright,
+                  Claude reads repo docs, installs deps, runs the E2E suite,
                   diagnoses failures, writes report
              → save report + artifacts → status=done
 ```
@@ -67,21 +67,21 @@ Access: bind the dashboard to localhost/Tailscale, or a Cloudflare Tunnel (no op
 | SQLite | VPS | `projects`, `runs` |
 | Worker | VPS | Lock, fetch, worktree, run `claude -p`, store results |
 | Test agent (`claude -p`) | VPS | Runs the repo-defined E2E suite, reports failures |
-| Playwright + Chromium | VPS | Headless browser (`npx playwright install --with-deps chromium`) |
+| Playwright + Chromium | VPS | Headless browser (MVP: Python Playwright in a venv, `playwright install --with-deps chromium`) |
 
 ## 5. Data model
 
 `projects`: `id, name, repo_url, branch (default agent/test), github_token_enc, env_secrets_enc (JSON), timeout_min`
 `runs`: `id, project_id, sha, status (queued|running|done|error|timeout), started_at, finished_at, exit_code, report_md, log_path, artifacts_dir`
 
-The **test command is not stored in the dashboard**. It lives in the repo (`CLAUDE.md`, e.g. "E2E: `npm ci && npx playwright test`; base URL in `.env.e2e`"), so the agent discovers it from the source.
+The **test command is not stored in the dashboard**. It lives in the repo (`CLAUDE.md`, e.g. "E2E: `bash scripts/e2e-ci.sh`; base URL in `E2E_BASE_URL`"), so the agent discovers it from the source.
 
 ## 6. Run flow
 
 1. Dev agent commits; `cloudtest` force-pushes `agent/test` (use `agent/test-<user>` if several machines push).
 2. `POST /api/runs {project, sha}` returns `202 {run_id}` immediately.
 3. Worker takes the lock, `git fetch` using the token via `GIT_ASKPASS` (never in the URL or on disk), creates a clean worktree at the SHA.
-4. Worker runs `claude -p` in the worktree with the fixed prompt, env vars injected (e.g. `BASE_URL`), under `timeout`.
+4. Worker runs `claude -p` in the worktree with the fixed prompt, env vars injected (e.g. `E2E_BASE_URL`), under `timeout`.
 5. Claude runs the suite, reads failures/screenshots, writes the report.
 6. Worker saves report + artifacts, sets `status=done` (or `error`/`timeout`).
 7. `cloudtest` (polling every ~5 s with backoff) prints the report; dev agent fixes and repeats.
@@ -94,7 +94,7 @@ Claude Code runs `cloudtest` as a **background command**, so it keeps working me
 ### Report format
 ```
 RESULT: FAIL  (42 passed, 3 failed)
-1. checkout.spec.ts:57 "applies coupon" — expected 10% off, got 0
+1. e2e/checkout/test_checkout.py:57 "test_applies_coupon" — expected 10% off, got 0
    cause: coupon API returned 404 on dev
    screenshot: artifacts/checkout-applies-coupon.png
 ```
@@ -105,7 +105,7 @@ RESULT: FAIL  (42 passed, 3 failed)
 - Detect auth failure and mark the run `error: claude login expired` instead of a vague failure.
 - Headless cannot prompt: set `--allowedTools` explicitly — Read, Grep, Glob, and Bash limited to install/test commands. Read-only: no Edit/Write.
 - Cap with `--max-turns` and wrap in `timeout`.
-- Optional cheaper variant: worker runs `npx playwright test` directly and calls Claude only on failure to diagnose.
+- Optional cheaper variant: worker runs the suite command directly and calls Claude only on failure to diagnose.
 
 Trade-offs: every run uses subscription limits; slightly non-deterministic (pin the command in the repo's `CLAUDE.md`); added model latency.
 
@@ -143,6 +143,6 @@ Redis, Caddy, webhooks, WebSocket, SSE streaming, `?wait=`, session resume, edit
 ## 12. Open questions
 
 - Does dev need a redeploy of my branch before tests, or do tests target what dev already serves?
-- Implementation language: Node (one language with Playwright) vs Python/FastAPI.
+- Implementation language: Node vs Python/FastAPI. (MVP chose Node 24 for server and CLI; the suite's Python lives only in its venv, see `docs/mvp/README.md` §2.)
 - How long to keep artifacts (e.g. 7 days)?
 - Auto-retry of failed tests?
