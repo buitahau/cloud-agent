@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createGitSync, buildGitEnv, GitSyncError } from '../src/gitSync.js';
+import { createGitSync, buildGitEnv, normalizeRemote, GitSyncError } from '../src/gitSync.js';
 import { createGitFixture, git } from '../test-support/gitFixture.js';
 
 function setup(over = {}) {
@@ -122,7 +122,7 @@ test('workspaceDir exists, non-empty, not a repo -> GitSyncError step "clone"', 
   try {
     fs.mkdirSync(fx.workspaceDir);
     fs.writeFileSync(path.join(fx.workspaceDir, 'stuff.txt'), 'x');
-    await assert.rejects(gs.sync('main'), /git clone failed: WORKSPACE_DIR exists and is not a git repo/);
+    await assert.rejects(gs.sync('main'), /git clone failed: workspace exists and is not a git repo/);
     assert.equal(fs.existsSync(path.join(fx.workspaceDir, 'stuff.txt')), true); // untouched
   } finally { fx.cleanup(); }
 });
@@ -158,7 +158,7 @@ test('log callback receives "[git] $ git ..." lines', async () => {
 test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+token -> GIT_CONFIG_* header; token never in argv', async () => {
   const base = { PATH: '/bin' };
   const plain = buildGitEnv({ baseEnv: base, repoUrl: 'git@github.com:o/r.git' });
-  assert.deepEqual(plain, { PATH: '/bin', GIT_TERMINAL_PROMPT: '0' });
+  assert.deepEqual(plain, { PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'https:ssh:file' });
   assert.deepEqual(base, { PATH: '/bin' });
 
   const ssh = buildGitEnv({ baseEnv: base, repoUrl: 'git@github.com:o/r.git', sshKeyPath: '/home/u/.ssh/id', token: 'tok' });
@@ -168,7 +168,7 @@ test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+toke
 
   const https = buildGitEnv({ baseEnv: base, repoUrl: 'https://github.com/o/r.git', token: 'ghp_secret' });
   assert.equal(https.GIT_CONFIG_COUNT, '1');
-  assert.equal(https.GIT_CONFIG_KEY_0, 'http.extraHeader');
+  assert.equal(https.GIT_CONFIG_KEY_0, 'http.https://github.com/.extraHeader'); // token only sent to the repo's own host
   assert.equal(https.GIT_CONFIG_VALUE_0, `Authorization: Basic ${Buffer.from('x-access-token:ghp_secret').toString('base64')}`);
 
   // token is passed via env only, never argv
@@ -184,4 +184,49 @@ test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+toke
   assert.equal(calls[0].env.GIT_TERMINAL_PROMPT, '0');
   assert.ok(calls[0].env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic '));
   fs.rmSync('/tmp/cloud-agent-never-exists-xyz', { recursive: true, force: true });
+});
+
+test('two repos synced into two workspaces stay independent', async () => {
+  const a = setup();
+  const b = setup();
+  try {
+    a.fx.commit('main', 'A.txt', 'from a\n');
+    b.fx.commit('main', 'B.txt', 'from b\n');
+    await a.gs.sync('main');
+    await b.gs.sync('main');
+    assert.equal(read(a.fx, 'A.txt'), 'from a\n');
+    assert.equal(read(b.fx, 'B.txt'), 'from b\n');
+    assert.equal(fs.existsSync(path.join(a.fx.workspaceDir, 'B.txt')), false);
+    assert.equal(fs.existsSync(path.join(b.fx.workspaceDir, 'A.txt')), false);
+  } finally { a.fx.cleanup(); b.fx.cleanup(); }
+});
+
+test('workspace that is a clone of a different repo -> GitSyncError("validate"), nothing synced', async () => {
+  const a = setup();
+  const other = createGitFixture();
+  try {
+    await a.gs.sync('main');
+    const wrong = createGitSync({ repoUrl: other.originUrl, workspaceDir: a.fx.workspaceDir, timeoutMs: 30_000 });
+    await rejectsStep(wrong.sync('main'), 'validate');
+    await assert.rejects(wrong.sync('main'), /different repo/);
+    // same repo still syncs fine
+    await a.gs.sync('dev');
+    assert.equal(read(a.fx, 'README.md'), 'dev\n');
+  } finally { a.fx.cleanup(); other.cleanup(); }
+});
+
+test('normalizeRemote ignores trailing ".git" / "/" and https host case', () => {
+  assert.equal(normalizeRemote('https://GitHub.com/o/r.git'), normalizeRemote('https://github.com/o/r/'));
+  assert.equal(normalizeRemote('git@github.com:o/r.git'), 'git@github.com:o/r');
+  assert.notEqual(normalizeRemote('https://github.com/o/r'), normalizeRemote('https://github.com/o/r2'));
+});
+
+test('GIT_ALLOW_PROTOCOL blocks ext:: remotes even if one reached git', async () => {
+  const fx = createGitFixture();
+  try {
+    const marker = path.join(fx.root, 'pwned');
+    const gs = createGitSync({ repoUrl: `ext::sh -c touch% ${marker}`, workspaceDir: fx.workspaceDir, timeoutMs: 30_000 });
+    await rejectsStep(gs.sync('main'), 'clone');
+    assert.equal(fs.existsSync(marker), false);
+  } finally { fx.cleanup(); }
 });

@@ -1,5 +1,10 @@
 # Cloud Agent v1 — Implementation Plan
 
+> **Update:** the service now supports several repos and an admin dashboard. That design, and what changed
+> from the single-repo version described below, is in [MULTI_REPO_PLAN.md](MULTI_REPO_PLAN.md). Where this file
+> mentions `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR`, `GIT_TOKEN`, `GIT_SSH_KEY_PATH` or `/run-agent`, read
+> "the repo's entry in `REPOS_FILE`" and `/<repo>/run-agent`.
+
 Read `docs/PROJECT_OVERVIEW.md` (the spec) first. This file covers **how** to build it. Every
 design decision is already made here or in the JSDoc of each `src/` module. When this file and a JSDoc
 comment disagree, the JSDoc wins (it sits next to the code). Don't add dependencies.
@@ -210,12 +215,15 @@ Each transition appends `[job] <from> -> <to>` to the job log.
 
 ## 8. Deliberate simplifications vs. the spec
 
-- Jobs are in memory only, with no eviction and no SQLite. `data/` is git-ignored but unused.
-- One workspace and strict FIFO, as §7 of the spec says. No worktrees.
+- Jobs are in memory, optionally persisted to a JSONL file (`JOBS_FILE`, under the git-ignored `data/`); finished
+  jobs beyond `JOB_RETENTION_MAX` are dropped. No SQLite.
+- One workspace per repo; at most one job per repo at a time and `MAX_CONCURRENT_JOBS` overall (default 1 =
+  strict FIFO, as §7 of the spec says). No worktrees.
 - There is no cancel endpoint. `shutdown()` is the only abort path.
 - `logs_tail` is a bounded tail, not a full transcript.
 - `GIT_TOKEN` header injection is written for GitHub (`x-access-token`). Other hosts may need a different username.
-- If `WORKSPACE_DIR` already holds a clone of a *different* repo, nothing detects it. Delete the dir by hand.
+- A workspace that holds a clone of a *different* repo is detected (`git remote get-url origin`) and the job
+  fails with a "delete it so it is re-cloned" error. It is never deleted automatically.
 
 ---
 

@@ -26,7 +26,7 @@ test('toPublic returns exactly the spec keys (+ logs_tail, claude) in order', ()
   const store = createJobStore();
   const pub = store.toPublic(store.create({ prompt: 'p', branch: 'main' }));
   assert.deepEqual(Object.keys(pub),
-    ['id', 'status', 'prompt', 'branch', 'commit', 'created_at', 'started_at', 'finished_at', 'result', 'error', 'logs_tail', 'claude']);
+    ['id', 'status', 'prompt', 'repo_id', 'branch', 'commit', 'created_at', 'started_at', 'finished_at', 'result', 'error', 'logs_tail', 'claude']);
   assert.equal(pub.logs_tail, '');
   assert.equal(pub.claude, null);
   assert.doesNotThrow(() => JSON.stringify(pub));
@@ -43,7 +43,13 @@ test('happy path queued->pulling->running->succeeded sets started_at then finish
   store.transition(job.id, 'running');
   const meta = { session_id: 's', total_cost_usd: 0.1, num_turns: 2, duration_ms: 9, subtype: 'success', is_error: false };
   store.transition(job.id, 'succeeded', { result: 'done', error: null, claude: meta });
-  assert.equal(job.finished_at, '2026-11-25T10:00:02.000Z');
+  assert.equal(job.finished_at, '2026-11-25T10:00:03.000Z'); // every status change reads the clock once
+  assert.deepEqual(job.history, [
+    { status: 'queued', at: '2026-11-25T10:00:00.000Z' },
+    { status: 'pulling', at: '2026-11-25T10:00:01.000Z' },
+    { status: 'running', at: '2026-11-25T10:00:02.000Z' },
+    { status: 'succeeded', at: '2026-11-25T10:00:03.000Z' },
+  ]);
   const pub = store.toPublic(job);
   assert.equal(pub.status, 'succeeded');
   assert.equal(pub.commit, 'abc1234');
@@ -149,4 +155,126 @@ test('events: monotonic seq, status + terminal result events, replay via readEve
   assert.doesNotThrow(() => store.appendEvent(j2.id, 'log', {}));
   // events are internal: not in the public shape
   assert.ok(!('events' in store.toPublic(job)));
+});
+
+// ---- multi-repo: repo_id, query, summaries, retention, persistence hooks --------------------------------
+
+function finish(store, id, to = 'succeeded', patch = {}) {
+  store.transition(id, 'pulling');
+  if (to === 'failed' && patch.atPull) { store.transition(id, 'failed', { error: patch.error ?? 'git fetch failed: x' }); return; }
+  store.transition(id, 'running');
+  store.transition(id, to, to === 'succeeded' ? { result: 'ok' } : { error: 'boom' });
+}
+
+test('repo_id: defaults to "default", set from create({repoId}), exposed by toPublic', () => {
+  const store = createJobStore();
+  assert.equal(store.create({ prompt: 'p', branch: 'main' }).repo_id, 'default');
+  const j = store.create({ prompt: 'p', branch: 'main', repoId: 'web' });
+  assert.equal(j.repo_id, 'web');
+  assert.equal(store.toPublic(j).repo_id, 'web');
+});
+
+test('query: newest first, filters by repo and status, cursor paging', () => {
+  let n = 0;
+  const store = createJobStore({ genId: () => `job_${String(++n).padStart(2, '0')}` });
+  for (let i = 0; i < 6; i++) store.create({ prompt: 'p', branch: 'main', repoId: i % 2 ? 'api' : 'web' });
+  finish(store, 'job_01');
+  finish(store, 'job_03', 'failed');
+  assert.deepEqual(store.query().jobs.map((j) => j.id), ['job_06', 'job_05', 'job_04', 'job_03', 'job_02', 'job_01']);
+  assert.deepEqual(store.query({ repoId: 'web' }).jobs.map((j) => j.id), ['job_05', 'job_03', 'job_01']);
+  assert.deepEqual(store.query({ repoId: 'web', statuses: ['succeeded', 'failed'] }).jobs.map((j) => j.id), ['job_03', 'job_01']);
+  const p1 = store.query({ limit: 4 });
+  assert.deepEqual(p1.jobs.map((j) => j.id), ['job_06', 'job_05', 'job_04', 'job_03']);
+  assert.equal(p1.next, 'job_03');
+  const p2 = store.query({ limit: 4, before: p1.next });
+  assert.deepEqual(p2.jobs.map((j) => j.id), ['job_02', 'job_01']);
+  assert.equal(p2.next, null);
+  assert.equal(store.query({ repoId: 'web', limit: 3 }).next, null); // exactly 3 web jobs: no further page
+  assert.deepEqual(store.query({ repoId: 'nope' }).jobs, []);
+});
+
+test('toSummary: durations from history, previews truncated, claude cost/turns', () => {
+  const store = createJobStore({ now: clock() });
+  const j = store.create({ prompt: 'x'.repeat(250), branch: 'main', repoId: 'web' });
+  store.transition(j.id, 'pulling');
+  store.transition(j.id, 'running');
+  store.transition(j.id, 'failed', { error: 'e'.repeat(400), claude: { total_cost_usd: 0.5, num_turns: 3 } });
+  const s = store.toSummary(j);
+  assert.equal(s.queue_ms, 1000);
+  assert.equal(s.sync_ms, 1000);
+  assert.equal(s.run_ms, 1000);
+  assert.equal(s.prompt_preview.length, 201);
+  assert.equal(s.error_preview.length, 301);
+  assert.equal(s.cost_usd, 0.5);
+  assert.equal(s.num_turns, 3);
+  const g = store.create({ prompt: 'p', branch: 'main' });
+  store.transition(g.id, 'pulling');
+  store.transition(g.id, 'failed', { error: 'git fetch failed' });
+  const gs = store.toSummary(g);
+  assert.equal(gs.sync_ms, 1000); // pulling -> failed counts as sync time
+  assert.equal(gs.run_ms, null);
+});
+
+test('retention: only finished jobs are dropped, oldest finish first; queued/running stay', () => {
+  const store = createJobStore({ retentionMax: 2 });
+  const running = store.create({ prompt: 'p', branch: 'main' });
+  store.transition(running.id, 'pulling');
+  const done = [0, 1, 2].map(() => store.create({ prompt: 'p', branch: 'main' }));
+  for (const j of done) finish(store, j.id);
+  assert.equal(store.get(done[0].id), undefined);
+  assert.equal(store.readEvents(done[0].id), null);
+  assert.ok(store.get(done[1].id));
+  assert.ok(store.get(done[2].id));
+  assert.ok(store.get(running.id));
+});
+
+test('event retention: older finished jobs keep only their result event (SSE still replays + closes)', () => {
+  const store = createJobStore({ eventRetentionJobs: 1 });
+  const a = store.create({ prompt: 'p', branch: 'main' });
+  const b = store.create({ prompt: 'p', branch: 'main' });
+  finish(store, a.id);
+  assert.ok(store.readEvents(a.id).events.length > 1);
+  finish(store, b.id);
+  const ev = store.readEvents(a.id).events;
+  assert.deepEqual(ev.map((e) => e.type), ['result']);
+  assert.ok(store.readEvents(b.id).events.length > 1);
+});
+
+test('onPersist: called on create and each status change, not on log/event appends; snapshot has the log once finished', () => {
+  const snaps = [];
+  const store = createJobStore({ onPersist: (s) => snaps.push(s) });
+  const j = store.create({ prompt: 'p', branch: 'main', repoId: 'web' });
+  store.appendLog(j.id, 'hello');
+  store.appendEvent(j.id, 'tool_use', {});
+  finish(store, j.id);
+  assert.deepEqual(snaps.map((s) => s.status), ['queued', 'pulling', 'running', 'succeeded']);
+  assert.equal(snaps[0].log, undefined);
+  assert.ok(snaps[3].log.includes('hello'));
+  assert.equal(snaps[3].repo_id, 'web');
+  assert.doesNotThrow(() => JSON.stringify(snaps));
+  const throwing = createJobStore({ onPersist: () => { throw new Error('disk full'); } });
+  assert.doesNotThrow(() => finish(throwing, throwing.create({ prompt: 'p', branch: 'main' }).id));
+});
+
+test('hydrate: restores finished jobs, fails interrupted ones, result event replayable', () => {
+  const src = createJobStore();
+  const ok = src.create({ prompt: 'p', branch: 'main', repoId: 'web' });
+  src.appendLog(ok.id, 'line 1');
+  finish(src, ok.id);
+  const mid = src.create({ prompt: 'q', branch: 'dev', repoId: 'api' });
+  src.transition(mid.id, 'pulling');
+  const records = [src.snapshot(ok), src.snapshot(mid), { bogus: true }];
+
+  const store = createJobStore();
+  const r = store.hydrate(records);
+  assert.deepEqual(r, { loaded: 2, interrupted: 1 });
+  const a = store.get(ok.id);
+  assert.equal(a.status, 'succeeded');
+  assert.equal(a.repo_id, 'web');
+  assert.ok(store.readLog(ok.id).includes('line 1'));
+  assert.deepEqual(store.readEvents(ok.id).events.map((e) => e.type), ['result']);
+  const b = store.get(mid.id);
+  assert.equal(b.status, 'failed');
+  assert.equal(b.error, 'Service restarted while job was pulling');
+  assert.equal(store.readEvents(mid.id).events.at(-1).type, 'result');
 });

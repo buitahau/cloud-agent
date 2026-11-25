@@ -315,3 +315,145 @@ test('SSE events: a real job through worker + fake claude emits status, claude e
     fx.cleanup?.();
   }
 });
+
+// ---- multi-repo scheduling --------------------------------------------------------------------------------
+
+/** Stub repos whose sync() resolves immediately and a claude runner that waits until released per prompt. */
+function multiRepoDeps(repoIds, maxConcurrent) {
+  const store = createJobStore();
+  const gates = new Map();
+  const started = [];
+  let active = 0;
+  let maxActive = 0;
+  const repos = new Map(repoIds.map((id) => [id, { gitSync: { sync: async () => ({ commit: id }) }, workspaceDir: `/ws/${id}` }]));
+  const claudeRunner = {
+    run: ({ prompt, cwd, signal }) => {
+      active++; maxActive = Math.max(maxActive, active);
+      started.push({ prompt, cwd });
+      const d = deferred();
+      gates.set(prompt, d);
+      signal?.addEventListener('abort', () => d.resolve({ outcome: 'failed', result: null, error: 'aborted', meta: null }));
+      return d.promise.finally(() => { active--; });
+    },
+  };
+  const worker = createWorker({ store, repos, claudeRunner, maxConcurrent, logger: silent });
+  const submit = (repoId, prompt) => { const j = store.create({ prompt, branch: 'main', repoId }); worker.enqueue(j.id); return j; };
+  const release = (prompt) => gates.get(prompt).resolve(okOutcome(prompt));
+  const settle = async () => { for (let i = 0; i < 6; i++) await tick(); };
+  return { store, worker, submit, release, settle, started, maxActive: () => maxActive };
+}
+
+test('multi-repo: two repos with maxConcurrent=2 run in parallel, each in its own workspace', async () => {
+  const m = multiRepoDeps(['web', 'api'], 2);
+  const a = m.submit('web', 'a');
+  const b = m.submit('api', 'b');
+  await m.settle();
+  assert.equal(a.status, 'running');
+  assert.equal(b.status, 'running');
+  assert.deepEqual(m.started.map((s) => s.cwd).sort(), ['/ws/api', '/ws/web']);
+  assert.deepEqual(m.worker.stats().running.map((r) => r.repoId).sort(), ['api', 'web']);
+  m.release('a'); m.release('b');
+  await m.worker.onIdle();
+  assert.equal(m.maxActive(), 2);
+  assert.equal(a.commit, 'web');
+  assert.equal(b.commit, 'api');
+});
+
+test('multi-repo: same repo never runs two jobs at once, even with maxConcurrent=2', async () => {
+  const m = multiRepoDeps(['web'], 2);
+  const a = m.submit('web', 'a');
+  const b = m.submit('web', 'b');
+  await m.settle();
+  assert.equal(a.status, 'running');
+  assert.equal(b.status, 'queued');
+  assert.equal(m.worker.queueLength('web'), 1);
+  m.release('a');
+  await m.settle();
+  assert.equal(b.status, 'running');
+  m.release('b');
+  await m.worker.onIdle();
+  assert.equal(m.maxActive(), 1);
+});
+
+test('multi-repo: A1, A2, B1 with maxConcurrent=2 -> A1 and B1 together, A2 waits for A1 (skip-ahead keeps per-repo FIFO)', async () => {
+  const m = multiRepoDeps(['a', 'b'], 2);
+  const a1 = m.submit('a', 'a1');
+  const a2 = m.submit('a', 'a2');
+  const b1 = m.submit('b', 'b1');
+  await m.settle();
+  assert.deepEqual([a1.status, a2.status, b1.status], ['running', 'queued', 'running']);
+  m.release('b1');
+  await m.settle();
+  assert.equal(a2.status, 'queued'); // repo a still busy
+  m.release('a1');
+  await m.settle();
+  assert.equal(a2.status, 'running');
+  m.release('a2');
+  await m.worker.onIdle();
+  assert.deepEqual(m.started.map((s) => s.prompt), ['a1', 'b1', 'a2']);
+});
+
+test('multi-repo: maxConcurrent=1 across repos is strict FIFO, one at a time', async () => {
+  const m = multiRepoDeps(['a', 'b'], 1);
+  const jobs = [m.submit('a', 'x'), m.submit('b', 'y'), m.submit('a', 'z')];
+  for (const p of ['x', 'y', 'z']) {
+    await m.settle();
+    assert.deepEqual(jobs.map((j) => j.status).filter((s) => s === 'running').length, 1);
+    m.release(p);
+  }
+  await m.worker.onIdle();
+  assert.deepEqual(m.started.map((s) => s.prompt), ['x', 'y', 'z']);
+  assert.equal(m.maxActive(), 1);
+});
+
+test('multi-repo: shutdown aborts every running job and fails queued ones', async () => {
+  const m = multiRepoDeps(['a', 'b'], 2);
+  const a = m.submit('a', 'a');
+  const b = m.submit('b', 'b');
+  const q = m.submit('a', 'q');
+  await m.settle();
+  await m.worker.shutdown('bye');
+  assert.equal(a.status, 'failed');
+  assert.equal(b.status, 'failed');
+  assert.equal(q.status, 'failed');
+  assert.equal(q.error, 'bye');
+  assert.deepEqual(m.worker.runningJobIds(), []);
+});
+
+test('multi-repo: job for an unknown repo fails without blocking others', async () => {
+  const m = multiRepoDeps(['a'], 1);
+  const bad = m.submit('ghost', 'g');
+  const good = m.submit('a', 'ok');
+  await m.settle();
+  assert.equal(bad.status, 'failed');
+  assert.equal(bad.error, 'unknown repo "ghost"');
+  assert.equal(good.status, 'running');
+  m.release('ok');
+  await m.worker.onIdle();
+  assert.equal(good.status, 'succeeded');
+});
+
+test('multi-repo (real git + fake claude): each job runs in its own repo workspace', async () => {
+  const fa = createGitFixture();
+  const fb = createGitFixture();
+  try {
+    fa.commit('main', 'WHO.txt', 'repo-a\n');
+    fb.commit('main', 'WHO.txt', 'repo-b\n');
+    const store = createJobStore();
+    const claudeRunner = createClaudeRunner({ claudeBin: FAKE_CLAUDE, permissionMode: 'bypassPermissions', maxTurns: 5, timeoutMs: 10_000, killGraceMs: 200 });
+    const repos = new Map([
+      ['a', { gitSync: createGitSync({ repoUrl: fa.originUrl, workspaceDir: fa.workspaceDir, timeoutMs: 30_000 }), workspaceDir: fa.workspaceDir }],
+      ['b', { gitSync: createGitSync({ repoUrl: fb.originUrl, workspaceDir: fb.workspaceDir, timeoutMs: 30_000 }), workspaceDir: fb.workspaceDir }],
+    ]);
+    const worker = createWorker({ store, repos, claudeRunner, maxConcurrent: 2, logger: silent });
+    const ja = store.create({ prompt: '[[fake:cat=WHO.txt]]', branch: 'main', repoId: 'a' });
+    const jb = store.create({ prompt: '[[fake:cat=WHO.txt]]', branch: 'main', repoId: 'b' });
+    worker.enqueue(ja.id);
+    worker.enqueue(jb.id);
+    await worker.onIdle();
+    assert.equal(ja.status, 'succeeded', ja.error);
+    assert.equal(jb.status, 'succeeded', jb.error);
+    assert.match(ja.result, /repo-a/);
+    assert.match(jb.result, /repo-b/);
+  } finally { fa.cleanup(); fb.cleanup(); }
+});

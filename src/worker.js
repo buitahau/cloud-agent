@@ -1,35 +1,55 @@
 // src/worker.js
-// FIFO queue + single worker: exactly one job runs at a time against the single workspace (spec §7, T11).
+// Scheduler: one global FIFO, at most ONE job per repo at a time (each repo has a single working tree), and at most
+// maxConcurrent jobs overall. With maxConcurrent = 1 (the default) this is a strict FIFO, one job at a time (T11).
 
 import { STATUS, TERMINAL_STATUSES } from './jobStore.js';
 
 /**
  * @typedef {Object} Worker
  * @property {(id: string) => void} enqueue
- *           Push id onto the FIFO and schedule a drain (setImmediate). Returns synchronously — POST must not wait.
- * @property {() => number} queueLength      ids waiting (excludes the one running)
- * @property {() => string|null} currentJobId
+ *           Push id onto the FIFO and schedule a pump (setImmediate). Returns synchronously — POST must not wait.
+ * @property {(repoId?: string) => number} queueLength   ids waiting (excludes running ones), optionally for one repo
+ * @property {() => string|null} currentJobId           first running job (compat with the single-lane worker)
+ * @property {() => string[]} runningJobIds
+ * @property {() => WorkerStats} stats
  * @property {() => Promise<void>} onIdle    resolves when queue is empty AND nothing is running (immediately if idle).
  *                                            Used by tests and graceful shutdown.
  * @property {(reason?: string) => Promise<void>} shutdown
  *           Stop accepting work: mark every still-queued job failed (error = reason ?? 'Service shutting down'),
- *           abort the running job's AbortController (claude/git process group gets killed by runProcess),
+ *           abort every running job's AbortController (claude/git process group gets killed by runProcess),
  *           then await onIdle(). After shutdown, enqueue() marks the job failed immediately.
+ */
+
+/**
+ * @typedef {Object} WorkerStats
+ * @property {number} maxConcurrent
+ * @property {number} queued
+ * @property {Array<{ jobId: string, repoId: string }>} running
+ */
+
+/**
+ * What the worker needs to run a job against one repo.
+ * @typedef {Object} RepoRuntime
+ * @property {import('./gitSync.js').GitSync} gitSync
+ * @property {string} workspaceDir   cwd for claude
  */
 
 /**
  * @typedef {Object} WorkerDeps
  * @property {import('./jobStore.js').JobStore} store
- * @property {import('./gitSync.js').GitSync} gitSync
- * @property {import('./claudeRunner.js').ClaudeRunner} claudeRunner
- * @property {string} workspaceDir   cwd for claude
+ * @property {import('./claudeRunner.js').ClaudeRunner} claudeRunner   shared by all repos (stateless per run)
+ * @property {{ get(id: string): RepoRuntime|undefined }} [repos]     registry (a Map works). Required unless the
+ *           single-repo form { gitSync, workspaceDir } is given, which becomes repo "default".
+ * @property {import('./gitSync.js').GitSync} [gitSync]
+ * @property {string} [workspaceDir]
+ * @property {number} [maxConcurrent=1]
  * @property {{ info: Function, warn: Function, error: Function }} [logger=console]
  */
 
 /**
- * Factory. Drain loop: `while (queue.length && !stopped) { await processJob(queue.shift()) }` guarded by a
- * `draining` flag so only one loop ever runs. processJob never throws (see below), but wrap it anyway and
- * log via logger.error — a bug must never kill the loop or the process (T9: "service stays up").
+ * Factory. pump() walks the FIFO and starts every job whose repo is free while running < maxConcurrent; a job whose
+ * repo is busy is skipped (it keeps its place), so per-repo order is FIFO and other repos are not blocked behind it.
+ * processJob never throws (see below), but it is wrapped anyway — a bug must never kill the scheduler (T9).
  *
  * @param {WorkerDeps} deps
  * @returns {Worker}
@@ -37,19 +57,21 @@ import { STATUS, TERMINAL_STATUSES } from './jobStore.js';
 export function createWorker(deps) {
   const logger = deps.logger ?? console;
   const { store } = deps;
+  const maxConcurrent = Math.max(1, deps.maxConcurrent ?? 1);
+  const repos = deps.repos ?? new Map([['default', { gitSync: deps.gitSync, workspaceDir: deps.workspaceDir }]]);
   /** @type {string[]} */
   const queue = [];
-  let draining = false;
+  /** @type {Map<string, { repoId: string, abort: AbortController }>} jobId -> running entry (insertion = start order) */
+  const running = new Map();
+  /** @type {Set<string>} */
+  const busyRepos = new Set();
   let stopped = false;
+  let pumpScheduled = false;
   let shutdownReason = 'Service shutting down';
-  /** @type {string|null} */
-  let current = null;
-  /** @type {AbortController|null} */
-  let currentAbort = null;
   /** @type {Array<() => void>} */
   let idleWaiters = [];
 
-  const isIdle = () => !draining && queue.length === 0 && current === null;
+  const isIdle = () => !pumpScheduled && queue.length === 0 && running.size === 0;
   const notifyIdle = () => {
     if (!isIdle()) return;
     const waiters = idleWaiters;
@@ -66,27 +88,49 @@ export function createWorker(deps) {
     }
   };
 
-  async function drain() {
-    if (draining) return;
-    draining = true;
-    try {
-      while (queue.length && !stopped) {
-        const id = /** @type {string} */ (queue.shift());
-        current = id;
-        currentAbort = new AbortController();
-        try {
-          await processJob(deps, id, currentAbort.signal);
-        } catch (err) {
-          logger.error(`[worker] unexpected error processing ${id}:`, err);
-        } finally {
-          current = null;
-          currentAbort = null;
-        }
-      }
-    } finally {
-      draining = false;
+  const schedulePump = () => {
+    if (pumpScheduled) return;
+    pumpScheduled = true;
+    setImmediate(() => {
+      pumpScheduled = false;
+      try { pump(); } catch (err) { logger.error('[worker] pump failed:', err); }
       notifyIdle();
+    });
+  };
+
+  function pump() {
+    for (let i = 0; i < queue.length && running.size < maxConcurrent && !stopped;) {
+      const id = queue[i];
+      const job = store.get(id);
+      if (!job || job.status !== STATUS.QUEUED) { // vanished (retention) or already handled: drop it
+        queue.splice(i, 1);
+        continue;
+      }
+      if (busyRepos.has(job.repo_id)) { i++; continue; }
+      queue.splice(i, 1);
+      const repo = repos.get(job.repo_id);
+      if (!repo) {
+        failQueued(id, `unknown repo "${job.repo_id}"`);
+        continue;
+      }
+      start(id, job.repo_id, repo);
     }
+  }
+
+  function start(id, repoId, repo) {
+    const abort = new AbortController();
+    running.set(id, { repoId, abort });
+    busyRepos.add(repoId);
+    const jobDeps = { store, claudeRunner: deps.claudeRunner, logger, gitSync: repo.gitSync, workspaceDir: repo.workspaceDir };
+    Promise.resolve()
+      .then(() => processJob(jobDeps, id, abort.signal))
+      .catch((err) => logger.error(`[worker] unexpected error processing ${id}:`, err))
+      .finally(() => {
+        running.delete(id);
+        busyRepos.delete(repoId);
+        if (queue.length && !stopped) schedulePump();
+        notifyIdle();
+      });
   }
 
   return {
@@ -96,10 +140,19 @@ export function createWorker(deps) {
         return;
       }
       queue.push(id);
-      setImmediate(() => { drain().catch((err) => logger.error('[worker] drain failed:', err)); });
+      schedulePump();
     },
-    queueLength: () => queue.length,
-    currentJobId: () => current,
+    queueLength(repoId) {
+      if (repoId === undefined) return queue.length;
+      return queue.filter((id) => store.get(id)?.repo_id === repoId).length;
+    },
+    currentJobId: () => running.keys().next().value ?? null,
+    runningJobIds: () => [...running.keys()],
+    stats: () => ({
+      maxConcurrent,
+      queued: queue.length,
+      running: [...running].map(([jobId, r]) => ({ jobId, repoId: r.repoId })),
+    }),
     onIdle() {
       if (isIdle()) return Promise.resolve();
       return new Promise((resolve) => idleWaiters.push(resolve));
@@ -109,7 +162,7 @@ export function createWorker(deps) {
       shutdownReason = reason ?? 'Service shutting down';
       const pending = queue.splice(0, queue.length);
       for (const id of pending) failQueued(id, shutdownReason);
-      if (currentAbort) currentAbort.abort();
+      for (const r of running.values()) r.abort.abort();
       notifyIdle();
       await this.onIdle();
     },

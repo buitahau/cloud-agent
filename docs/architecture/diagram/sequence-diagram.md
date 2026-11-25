@@ -12,28 +12,31 @@ sequenceDiagram
     participant S as server.js
     participant ST as jobStore
     participant W as worker
-    participant G as gitSync
+    participant RG as repoRegistry
+    participant G as gitSync (of that repo)
     participant R as claudeRunner
     participant CLI as claude CLI
     participant O as Origin repo
 
-    C->>S: POST /run-agent {prompt, branch?} (x-api-key)
-    S->>S: apiKeyAuth + validate body
-    S->>ST: create(prompt, branch)
+    C->>S: POST /<repo>/run-agent {prompt, branch?} (x-api-key)
+    S->>S: apiKeyAuth, then repo configured? (else 404), validate body
+    S->>ST: create(prompt, branch ?? repo.defaultBranch, repoId)
     ST-->>S: job (queued)
     S->>W: enqueue(job.id)
     S-->>C: 202 {id, status: "queued"}
 
-    Note over W: setImmediate -> drain(), one job at a time
+    Note over W: setImmediate -> pump(): start each queued job whose repo is free,<br/>while running < MAX_CONCURRENT_JOBS
+    W->>RG: get(job.repo_id)
+    RG-->>W: {gitSync, workspaceDir}
     W->>ST: transition(id, pulling)
     W->>G: sync(branch, log, signal)
-    G->>O: git clone (first run) / fetch origin/branch
+    G->>O: git clone (first run) / check origin URL, fetch origin/branch
     G->>G: checkout, reset --hard, clean
     G-->>W: {commit}
     W->>ST: update(id, {commit})
 
     W->>ST: transition(id, running)
-    W->>R: run({prompt, cwd, log, onEvent, signal})
+    W->>R: run({prompt, cwd: workspaces/<repo>, log, onEvent, signal})
     R->>CLI: spawn claude -p --output-format stream-json --verbose (prompt on stdin)
     loop each stdout line (NDJSON)
         CLI-->>R: init / assistant / user / result line
@@ -57,7 +60,7 @@ sequenceDiagram
     participant ST as jobStore
 
     loop until status is succeeded | failed | timeout
-        C->>S: GET /run-agent/:id (x-api-key)
+        C->>S: GET /<repo>/run-agent/:id (x-api-key)
         S->>ST: get(id)
         alt unknown id
             ST-->>S: undefined
@@ -79,7 +82,7 @@ sequenceDiagram
     participant ST as jobStore
     participant W as worker
 
-    C->>S: GET /run-agent/:id/events (x-api-key, Last-Event-ID?)
+    C->>S: GET /<repo>/run-agent/:id/events (x-api-key, Last-Event-ID?)
     S->>ST: get(id)
     alt unknown id
         S-->>C: 404 {error: "job not found"}
@@ -162,4 +165,35 @@ sequenceDiagram
         S->>S: closeStreams() ends remaining SSE responses
         S->>S: process exit
     end
+```
+
+## Admin dashboard
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Admin (browser)
+    participant AD as admin.js
+    participant RG as repoRegistry
+    participant ST as jobStore
+    participant W as worker
+
+    A->>AD: GET /admin/ (no credentials)
+    AD-->>A: 401 WWW-Authenticate: Basic
+    A->>AD: GET /admin/ (Authorization: Basic …)
+    AD-->>A: index.html, app.js, style.css
+
+    loop every 5 s on overview / repo / jobs pages
+        A->>AD: GET /admin/api/summary, /admin/api/repos
+        AD->>W: stats(), queueLength(repo)
+        AD->>RG: status(repo, store, worker)
+        RG->>ST: list() -> health from the newest job that reached "pulling"
+        AD-->>A: JSON (Cache-Control: no-store)
+    end
+
+    A->>AD: GET /admin/api/jobs/:id
+    AD->>ST: get, readLog, history
+    AD-->>A: job + history + full log
+    A->>AD: EventSource /admin/api/jobs/:id/events (Basic resent by the browser)
+    AD-->>A: same SSE handler as the API: replay, live events, closes after result
 ```

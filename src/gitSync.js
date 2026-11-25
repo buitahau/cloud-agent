@@ -1,5 +1,5 @@
 // src/gitSync.js
-// Bring WORKSPACE_DIR to a pristine checkout of origin/<branch> and report the short commit.
+// Bring one repo's workspace to a pristine checkout of origin/<branch> and report the short commit.
 // Covers T5 (latest code), T6 (branch selection), T12 (clean workspace), T9 (bad URL -> failed).
 
 import fs from 'node:fs';
@@ -47,8 +47,11 @@ export class GitSyncError extends Error {
  * Factory. Exact command sequence for sync(branch) (all via `run`, no shell, cwd as noted):
  *
  *  0. if (!isValidBranchName(branch)) throw new GitSyncError('validate', 'invalid branch name')
- *  1. if !exists(path.join(workspaceDir, '.git')):
- *       - if workspaceDir exists and is non-empty -> GitSyncError('clone', 'WORKSPACE_DIR exists and is not a git repo')
+ *  1. if exists(path.join(workspaceDir, '.git')):
+ *       - git remote get-url origin must equal repoUrl (ignoring a trailing "/" or ".git"),
+ *         else GitSyncError('validate', ...) — never sync/run in a clone of another repo
+ *     else:
+ *       - if workspaceDir exists and is non-empty -> GitSyncError('clone', 'workspace exists and is not a git repo')
  *       - mkdir -p path.dirname(workspaceDir)
  *       - git clone --no-checkout -- <repoUrl> <workspaceDir>          (cwd: dirname(workspaceDir))
  *       - on failure: fs.rmSync(workspaceDir, {recursive:true, force:true}) so the next job retries a clean clone
@@ -113,10 +116,15 @@ export function createGitSync(opts) {
         return r;
       };
 
-      // 1. clone on first run
-      if (!fs.existsSync(path.join(workspaceDir, '.git'))) {
+      // 1. clone on first run; otherwise make sure the workspace really is a clone of THIS repo
+      if (fs.existsSync(path.join(workspaceDir, '.git'))) {
+        const r = await git('validate', ['remote', 'get-url', 'origin'], workspaceDir);
+        if (normalizeRemote(r.stdout.trim()) !== normalizeRemote(repoUrl)) {
+          throw new GitSyncError('validate', 'workspace is a clone of a different repo; delete it so it is re-cloned');
+        }
+      } else {
         if (fs.existsSync(workspaceDir) && fs.readdirSync(workspaceDir).length > 0) {
-          throw new GitSyncError('clone', 'WORKSPACE_DIR exists and is not a git repo');
+          throw new GitSyncError('clone', 'workspace exists and is not a git repo');
         }
         const parent = path.dirname(workspaceDir);
         fs.mkdirSync(parent, { recursive: true });
@@ -142,12 +150,14 @@ export function createGitSync(opts) {
 /**
  * Build the child env for git. Never mutates baseEnv. Secrets go in env, never in argv or .git/config.
  *
- *  - Always: GIT_TERMINAL_PROMPT=0 (never hang on a credential prompt).
+ *  - Always: GIT_TERMINAL_PROMPT=0 (never hang on a credential prompt) and
+ *    GIT_ALLOW_PROTOCOL=https:ssh:file (no ext::/fd::/git:// transports, also for submodules).
  *  - If sshKeyPath: GIT_SSH_COMMAND = `ssh -i '<sshKeyPath>' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`
- *    (single-quote the path; reject/escape paths containing a single quote).
- *  - If token AND repoUrl starts with "https://": inject an auth header via git's env-config (git >= 2.31):
+ *    (single-quote the path; reject paths containing a single quote).
+ *  - If token AND repoUrl starts with "https://": inject an auth header via git's env-config (git >= 2.31),
+ *    scoped to the repo's own origin so redirects/submodules on other hosts never receive the token:
  *      GIT_CONFIG_COUNT=1
- *      GIT_CONFIG_KEY_0=http.extraHeader
+ *      GIT_CONFIG_KEY_0=http.<https://host[:port]/>.extraHeader
  *      GIT_CONFIG_VALUE_0=`Authorization: Basic ${base64('x-access-token:' + token)}`
  *    (works for GitHub PATs and GitHub App tokens).
  *
@@ -155,16 +165,31 @@ export function createGitSync(opts) {
  * @returns {NodeJS.ProcessEnv}
  */
 export function buildGitEnv(p) {
-  const env = { ...p.baseEnv, GIT_TERMINAL_PROMPT: '0' };
+  const env = { ...p.baseEnv, GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'https:ssh:file' };
   if (p.sshKeyPath) {
-    if (p.sshKeyPath.includes("'")) throw new GitSyncError('validate', 'GIT_SSH_KEY_PATH must not contain a single quote');
+    if (p.sshKeyPath.includes("'")) throw new GitSyncError('validate', 'sshKeyPath must not contain a single quote');
     env.GIT_SSH_COMMAND = `ssh -i '${p.sshKeyPath}' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
   }
   if (p.token && typeof p.repoUrl === 'string' && p.repoUrl.startsWith('https://')) {
+    let origin;
+    try { origin = new URL(p.repoUrl).origin; } catch { throw new GitSyncError('validate', 'repo URL is not a valid https URL'); }
     const basic = Buffer.from(`x-access-token:${p.token}`, 'utf8').toString('base64');
     env.GIT_CONFIG_COUNT = '1';
-    env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+    env.GIT_CONFIG_KEY_0 = `http.${origin}/.extraHeader`;
     env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basic}`;
   }
   return env;
+}
+
+/**
+ * Compare-friendly form of a remote URL: trailing "/" and ".git" removed, https host lowercased.
+ * @param {string} url
+ * @returns {string}
+ */
+export function normalizeRemote(url) {
+  let u = url.trim().replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/+$/, '');
+  if (/^https:\/\//i.test(u)) {
+    try { const x = new URL(u); u = `https://${x.host.toLowerCase()}${x.pathname.replace(/\/+$/, '')}`; } catch { /* keep as is */ }
+  }
+  return u;
 }
