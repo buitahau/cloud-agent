@@ -1,6 +1,7 @@
 // src/admin.js
-// Read-only admin dashboard: static page (src/admin/public) + JSON API under /admin/api, behind HTTP Basic auth
-// with its own credentials (ADMIN_USER / ADMIN_PASSWORD). Not mounted at all when ADMIN_PASSWORD is unset.
+// Read-only admin dashboard: React single-page app (built from web/ into web/dist by `npm run build:web`) + JSON API
+// under /admin/api, behind HTTP Basic auth with its own credentials (ADMIN_USER / ADMIN_PASSWORD). Not mounted at
+// all when ADMIN_PASSWORD is unset.
 //
 // Basic auth is used because the browser shows its own prompt and resends the credentials automatically on
 // same-origin requests — including EventSource, so the live job view needs no fetch-stream workaround.
@@ -8,13 +9,14 @@
 // because browsers attach Basic credentials automatically.
 
 import express from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { STATUS } from './jobStore.js';
 import { isValidRepoId, validateJobListQuery } from './lib/validate.js';
 
-const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'admin', 'public');
+const DEFAULT_PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web', 'dist');
 
 /**
  * @param {Object} deps
@@ -24,6 +26,7 @@ const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'admi
  * @param {import('./repoRegistry.js').RepoRegistry} deps.repos
  * @param {boolean} [deps.persistence=false]   whether JOBS_FILE is on (shown on the overview)
  * @param {() => number} [deps.now]            ms clock (tests)
+ * @param {string} [deps.publicDir]            built SPA directory (default web/dist)
  * @returns {(makeSse: (findJob: (req: import('express').Request) => any) => import('express').RequestHandler) => import('express').Router}
  */
 export function createAdminRouter(deps) {
@@ -117,16 +120,38 @@ export function createAdminRouter(deps) {
     api.use((_req, res) => { res.status(404).json({ error: 'not found' }); });
 
     router.use('/api', api);
-    router.use(express.static(PUBLIC_DIR, { index: 'index.html', fallthrough: true, maxAge: 0 }));
+    mountSpa(router, deps.publicDir ?? DEFAULT_PUBLIC_DIR);
     router.use((_req, res) => { res.status(404).json({ error: 'not found' }); });
     return router;
   };
 }
 
+/**
+ * Serve the built SPA: hashed /assets cached forever, index.html never cached, and every extension-less GET
+ * (client-side routes like /admin/jobs/<id>) falls back to index.html. Missing files with an extension -> 404.
+ * If the app was never built, page requests get a 503 that says how to build it.
+ * @param {import('express').Router} router
+ * @param {string} dir
+ */
+function mountSpa(router, dir) {
+  const index = path.join(dir, 'index.html');
+  const built = fs.existsSync(index);
+  router.use('/assets', express.static(path.join(dir, 'assets'), { immutable: true, maxAge: '1y', index: false }));
+  router.use(express.static(dir, { index: false, maxAge: 0 }));
+  router.get('*', (req, res, next) => {
+    if (path.extname(req.path)) { next(); return; }
+    if (!built) {
+      res.status(503).type('text/plain').send('admin dashboard not built: run `npm run build:web`\n');
+      return;
+    }
+    res.sendFile(index, { headers: { 'Cache-Control': 'no-cache' } });
+  });
+}
+
 /** @type {import('express').RequestHandler} */
 function securityHeaders(_req, res, next) {
   res.set({
-    'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
     'X-Frame-Options': 'DENY',

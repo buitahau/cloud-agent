@@ -181,7 +181,7 @@ sequenceDiagram
     A->>AD: GET /admin/ (no credentials)
     AD-->>A: 401 WWW-Authenticate: Basic
     A->>AD: GET /admin/ (Authorization: Basic …)
-    AD-->>A: index.html, app.js, style.css
+    AD-->>A: index.html + hashed assets (web/dist)
 
     loop every 5 s on overview / repo / jobs pages
         A->>AD: GET /admin/api/summary, /admin/api/repos

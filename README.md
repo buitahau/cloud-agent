@@ -89,13 +89,26 @@ Ctrl-C / SIGTERM shuts down gracefully: queued jobs are marked failed, running c
 Set `ADMIN_PASSWORD` (≥ 8 chars, different from `API_KEY`) and open `http://localhost:8080/admin/`; the browser asks
 for `ADMIN_USER` (default `admin`) / `ADMIN_PASSWORD`. Without `ADMIN_PASSWORD`, `/admin` does not exist (404).
 
+The dashboard is a React + Ant Design app in `web/` (needs Node ≥ 22.22 to build; the server itself still runs on
+Node ≥ 18.20). Build it once before starting the server — until then `/admin/` answers `503 dashboard not built`:
+
+```bash
+npm run build:web      # installs web/ deps and writes web/dist (gitignored), served by Express at /admin/
+npm start
+```
+
+For UI development, run the server (`npm run dev`) and, in another terminal, `npm run dev:web`, then open
+`http://localhost:5173/admin/`. Vite proxies `/admin/api` to `http://localhost:8080` (override with
+`ADMIN_API_TARGET`). `npm run test:web` type-checks the app.
+
 - **Overview:** running/queued jobs, 24h outcome counts, and a card per repo: health (`ok`, `sync error`,
   `syncing`, `never synced`), last sync (branch, commit, duration, error), whether it's cloned, what's running now,
   job counts.
 - **Repo** and **Jobs:** job tables filterable by repo and status, with queue/sync/run times, cost and turns.
 - **Job detail:** status timeline, prompt, result, error, full log, and the live event stream while it runs.
 
-It is read-only. Admins can read every job's prompt, result and log. Basic auth sends the password with every
+It is read-only. Pages have real URLs (`/admin/jobs/<id>`, `/admin/repos/<id>?status=failed`), so they can be
+bookmarked and shared. Admins can read every job's prompt, result and log. Basic auth sends the password with every
 request, so put TLS (a reverse proxy) in front of anything that isn't localhost. The dashboard's JSON API is
 under `/admin/api/` (`summary`, `repos`, `repos/<id>`, `jobs?repo=&status=&limit=&before=`, `jobs/<id>`,
 `jobs/<id>/events`).

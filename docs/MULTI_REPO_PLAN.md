@@ -127,6 +127,8 @@ start → processJob(perRepoDeps, id, signal).finally(() => { release; notifyIdl
 
 **Delivery**: static HTML + vanilla JS via `express.static` at `src/admin/public/{index.html,app.js,style.css}`. No build, no inline scripts (strict CSP). Hash routing. Lists poll every 5 s; job detail uses SSE.
 
+> **Superseded:** the dashboard was rewritten in React + Ant Design (`web/`, clean `/admin/...` URLs). See [REACT_ADMIN_PLAN.md](REACT_ADMIN_PLAN.md).
+
 **Views**
 1. **Overview `#/`** — totals (queued, running/max, 24h counts by status, uptime, persistence on/off); one card per repo: health badge (`ok` / `sync error` / `never synced` / `not cloned`), last sync (time, commit, branch, duration), last error, counts, running job, queue depth.
 2. **Repo `#/repos/:id`** — card + workspace path; job table with status filter + cursor paging (id, status, branch, commit, created, queue/sync/run, cost, turns, prompt preview).
