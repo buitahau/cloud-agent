@@ -49,7 +49,7 @@ flowchart LR
 | `src/config.js` | Parse and validate env and the repos file (`REPOS_FILE`): ids, URLs, per-repo credentials, workspace paths. |
 | `src/repoRegistry.js` | The configured repos, one `gitSync` each; repo health/status derived from job history. |
 | `src/server.js` | API routes (`/repos`, `/<repo>/run-agent...`), `x-api-key` auth, `createSseHandler` (shared with admin), `closeStreams`. |
-| `src/admin.js` + `src/admin/public/` | Read-only dashboard (static HTML/JS) and its JSON API, behind HTTP Basic auth. |
+| `src/admin.js` + `web/` | Read-only dashboard (React + Ant Design app built into `web/dist`) and its JSON API, behind HTTP Basic auth. |
 | `src/jobStore.js` | In-memory jobs; the **only** code allowed to change status. Status history, listing/paging, retention, per-job log ring and event ring with subscribers, snapshot/hydrate for persistence. |
 | `src/jobPersistence.js` | Optional append-only JSONL of job snapshots (`JOBS_FILE`), compacted atomically. |
 | `src/worker.js` | Scheduler: global FIFO, at most one job per repo, at most `MAX_CONCURRENT_JOBS` overall. |
@@ -124,8 +124,13 @@ flowchart LR
 
 ## Admin dashboard
 
-- Static page (`src/admin/public`), hash routing, no build step. Lists poll every 5 s; job detail uses SSE.
-- All job text (prompts, logs, tool output, results) is untrusted and rendered with `textContent` only.
+- React + Ant Design single-page app in `web/` (Vite, TanStack Query, react-router), built into `web/dist` by
+  `npm run build:web` and served by Express: hashed `/admin/assets/*` cached for a year, `index.html` never cached,
+  and every other extension-less `GET /admin/*` falls back to `index.html` for client-side routing. Without a
+  build, pages answer 503. Lists poll every 5 s; job detail uses SSE (`web/src/hooks/useJobEvents.ts`).
+- All job text (prompts, logs, tool output, results) is untrusted and rendered through React's escaping only;
+  `dangerouslySetInnerHTML` is banned (a test scans `web/src`).
+- CSP allows `style-src 'unsafe-inline'` because antd injects its styles at runtime; scripts stay `'self'` only.
 - Repo health is derived, not stored: the newest job that entered `pulling` decides it (`running` next =
   `ok`, `failed` next = `sync_error`, still pulling = `syncing`, none = `never_synced`).
 - Not mounted unless `ADMIN_PASSWORD` is set. Read-only; CSP `default-src 'self'`, `frame-ancestors 'none'`,

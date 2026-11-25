@@ -378,11 +378,13 @@ const ADMIN = { adminUser: 'ops', adminPassword: 'admin-secret-pw' };
 const basic = (u, p) => ({ authorization: `Basic ${Buffer.from(`${u}:${p}`).toString('base64')}` });
 const AUTH = basic(ADMIN.adminUser, ADMIN.adminPassword);
 
-async function withAdmin(fn) {
+const ADMIN_FIXTURE = new URL('../test-support/admin-fixture/', import.meta.url).pathname;
+
+async function withAdmin(fn, { publicDir = ADMIN_FIXTURE } = {}) {
   const store = createJobStore();
   const registry = repos();
   const worker = { enqueue() {}, stats: () => ({ maxConcurrent: 2, queued: 0, running: [] }), queueLength: () => 0 };
-  const adminRouter = createAdminRouter({ config: ADMIN, store, worker, repos: registry, persistence: true });
+  const adminRouter = createAdminRouter({ config: ADMIN, store, worker, repos: registry, persistence: true, publicDir });
   const app = createApp({ config: { apiKey: KEY }, store, worker, repos: registry, logger: silent, adminRouter });
   const server = await startServer(app, 0, '127.0.0.1');
   try {
@@ -413,15 +415,54 @@ test('admin: Basic auth required; wrong creds / API key alone -> 401 + WWW-Authe
     assert.equal(ok.status, 200);
     assert.match(ok.headers.get('content-security-policy'), /default-src 'self'/);
     assert.match(ok.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.match(ok.headers.get('content-security-policy'), /style-src 'self' 'unsafe-inline'/); // antd runtime styles
+    assert.doesNotMatch(ok.headers.get('content-security-policy'), /script-src[^;]*unsafe/);
     assert.equal(ok.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(ok.headers.get('cache-control'), 'no-store');
     const page = await get(base, '/admin/', AUTH);
     assert.equal(page.status, 200);
     assert.match(page.headers.get('content-type'), /text\/html/);
     assert.match(await page.text(), /cloud-agent/);
-    assert.equal((await get(base, '/admin/app.js', AUTH)).status, 200);
-    assert.equal((await get(base, '/admin/app.js', {})).status, 401);
+    assert.equal((await get(base, '/admin/assets/app.js', AUTH)).status, 200);
+    assert.equal((await get(base, '/admin/assets/app.js', {})).status, 401);
+    assert.equal((await get(base, '/admin/jobs/job_x', {})).status, 401);
   });
+});
+
+test('admin: SPA serving — client routes fall back to index.html, assets cached, unknown files/API 404', async () => {
+  await withAdmin(async ({ base }) => {
+    for (const p of ['/admin/', '/admin/jobs', '/admin/jobs/job_abc', '/admin/repos/web?status=failed']) {
+      const res = await get(base, p, AUTH);
+      assert.equal(res.status, 200, p);
+      assert.match(res.headers.get('content-type'), /text\/html/, p);
+      assert.equal(res.headers.get('cache-control'), 'no-cache', p);
+      assert.match(await res.text(), /id="root"/, p);
+    }
+    const asset = await get(base, '/admin/assets/app.js', AUTH);
+    assert.match(asset.headers.get('cache-control'), /max-age=31536000.*immutable/);
+    assert.equal((await get(base, '/admin/assets/missing.js', AUTH)).status, 404);
+    assert.equal((await get(base, '/admin/missing.css', AUTH)).status, 404);
+    const api = await get(base, '/admin/api/nope', AUTH);
+    assert.equal(api.status, 404);
+    assert.deepEqual(await api.json(), { error: 'not found' });
+  });
+});
+
+test('admin: dashboard not built -> 503 with build hint (API still works)', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'admin-empty-'));
+  try {
+    await withAdmin(async ({ base }) => {
+      const res = await get(base, '/admin/', AUTH);
+      assert.equal(res.status, 503);
+      assert.match(await res.text(), /npm run build:web/);
+      assert.equal((await get(base, '/admin/api/summary', AUTH)).status, 200);
+    }, { publicDir: empty });
+  } finally {
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
 });
 
 test('admin: summary, repos (health from job history), repo detail, jobs list, job detail', async () => {
@@ -492,9 +533,15 @@ test('admin: job events SSE replays and closes (any repo, admin auth)', async ()
   });
 });
 
-test('admin: dashboard never uses innerHTML (untrusted job text is rendered as text)', async () => {
+test('admin: dashboard never injects raw HTML (untrusted job text is rendered as text)', async () => {
   const fs = await import('node:fs');
-  const src = fs.readFileSync(new URL('../src/admin/public/app.js', import.meta.url), 'utf8');
-  const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
-  assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(code));
+  const path = await import('node:path');
+  const root = new URL('../web/src/', import.meta.url).pathname;
+  const files = fs.readdirSync(root, { recursive: true }).map(String).filter((f) => /\.(tsx?|jsx?)$/.test(f));
+  assert.ok(files.length > 0, 'web/src has source files');
+  for (const f of files) {
+    const src = fs.readFileSync(path.join(root, f), 'utf8');
+    const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+    assert.ok(!/dangerouslySetInnerHTML|innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(code), f);
+  }
 });

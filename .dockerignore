@@ -1,0 +1,17 @@
+.git
+.github
+node_modules
+web/node_modules
+web/dist
+.env
+.env.*
+repos.json
+workspace
+workspaces
+data
+docs
+test
+test-support
+coverage
+*.log
+.claude

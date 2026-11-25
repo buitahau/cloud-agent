@@ -84,10 +84,48 @@ Ctrl-C / SIGTERM shuts down gracefully: queued jobs are marked failed, running c
   was running"). Unset = in memory only. The live event timeline is not saved; status, result and log are.
 - `JOB_RETENTION_MAX` (default `1000`) finished jobs are kept; older ones are dropped. Queued/running jobs never are.
 
+## Deploy (Docker + VPS)
+
+The image (`Dockerfile`) builds the dashboard, installs the Claude Code CLI globally and runs as the non-root `node`
+user. Claude's subscription login is **not** baked into the image: it lives in the `claude-home` volume
+(`/home/node`), so it survives redeploys. `.github/workflows/ci-cd.yml` tests every push/PR; on `main` it pushes
+`ghcr.io/<owner>/cloud-agent:<sha>` and deploys it to the VPS over SSH (`docker compose pull && up -d`).
+
+One-time VPS setup (Docker + compose plugin installed):
+
+```bash
+sudo mkdir -p /opt/cloud-agent && sudo chown $USER /opt/cloud-agent && cd /opt/cloud-agent
+# copy docker-compose.yml, .env and repos.json here (repos.json: "workspaceRoot": "./workspaces" is fine)
+echo <PAT with read:packages> | docker login ghcr.io -u <github-user> --password-stdin   # if the image is private
+docker compose pull
+docker compose run --rm cloud-agent claude      # then /login (open the URL, paste the code), then /exit
+docker compose up -d && docker compose logs -f  # expect "Claude auth OK" and "Listening on :8080"
+```
+
+GitHub repo settings: secrets `VPS_HOST`, `VPS_USER` (a user in the `docker` group), `VPS_SSH_KEY` (private key
+whose public half is in that user's `authorized_keys`), optional `VPS_PORT`; optional variable `DEPLOY_DIR`
+(default `/opt/cloud-agent`); an environment named `production` (add required reviewers there to gate deploys).
+
+Notes: the port is bound to `127.0.0.1` — put Caddy/nginx with TLS in front. A deploy restarts the service, so
+running jobs are marked failed. Claude jobs run *inside the container*, so add any toolchain the target repos need
+(browsers for e2e, python, ...) to the Dockerfile.
+
 ## Admin dashboard
 
 Set `ADMIN_PASSWORD` (≥ 8 chars, different from `API_KEY`) and open `http://localhost:8080/admin/`; the browser asks
 for `ADMIN_USER` (default `admin`) / `ADMIN_PASSWORD`. Without `ADMIN_PASSWORD`, `/admin` does not exist (404).
+
+The dashboard is a React + Ant Design app in `web/` (needs Node ≥ 22.22 to build; the server itself still runs on
+Node ≥ 18.20). Build it once before starting the server — until then `/admin/` answers `503 dashboard not built`:
+
+```bash
+npm run build:web      # installs web/ deps and writes web/dist (gitignored), served by Express at /admin/
+npm start
+```
+
+For UI development, run the server (`npm run dev`) and, in another terminal, `npm run dev:web`, then open
+`http://localhost:5173/admin/`. Vite proxies `/admin/api` to `http://localhost:8080` (override with
+`ADMIN_API_TARGET`). `npm run test:web` type-checks the app.
 
 - **Overview:** running/queued jobs, 24h outcome counts, and a card per repo: health (`ok`, `sync error`,
   `syncing`, `never synced`), last sync (branch, commit, duration, error), whether it's cloned, what's running now,
@@ -95,7 +133,8 @@ for `ADMIN_USER` (default `admin`) / `ADMIN_PASSWORD`. Without `ADMIN_PASSWORD`,
 - **Repo** and **Jobs:** job tables filterable by repo and status, with queue/sync/run times, cost and turns.
 - **Job detail:** status timeline, prompt, result, error, full log, and the live event stream while it runs.
 
-It is read-only. Admins can read every job's prompt, result and log. Basic auth sends the password with every
+It is read-only. Pages have real URLs (`/admin/jobs/<id>`, `/admin/repos/<id>?status=failed`), so they can be
+bookmarked and shared. Admins can read every job's prompt, result and log. Basic auth sends the password with every
 request, so put TLS (a reverse proxy) in front of anything that isn't localhost. The dashboard's JSON API is
 under `/admin/api/` (`summary`, `repos`, `repos/<id>`, `jobs?repo=&status=&limit=&before=`, `jobs/<id>`,
 `jobs/<id>/events`).

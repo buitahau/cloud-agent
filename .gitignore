@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Built admin dashboard (npm run build:web)
+web/dist/
+
 # Secrets / local config (keep .env.example tracked)
 .env
 repos.json

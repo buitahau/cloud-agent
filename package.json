@@ -12,7 +12,11 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "test": "node --test test/",
-    "test:e2e": "E2E=1 node --test test/e2e.test.js"
+    "test:e2e": "E2E=1 node --test test/e2e.test.js",
+    "dev:web": "npm --prefix web run dev",
+    "build:web": "npm --prefix web ci && npm --prefix web run build",
+    "build": "npm run build:web",
+    "test:web": "npm --prefix web run typecheck"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
