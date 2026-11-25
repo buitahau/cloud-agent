@@ -3,11 +3,13 @@ node_modules/
 
 # Secrets / local config (keep .env.example tracked)
 .env
+repos.json
 .env.*
 !.env.example
 
 # Runtime data
 workspace/
+workspaces/
 data/
 *.log
 npm-debug.log*

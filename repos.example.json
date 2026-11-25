@@ -1,0 +1,17 @@
+{
+  "workspaceRoot": "./workspaces",
+  "repos": [
+    {
+      "id": "web",
+      "url": "https://github.com/your-org/web.git",
+      "defaultBranch": "dev",
+      "auth": { "tokenEnv": "GIT_TOKEN_WEB" }
+    },
+    {
+      "id": "api",
+      "url": "git@github.com:your-org/api.git",
+      "defaultBranch": "main",
+      "auth": { "sshKeyPath": "~/.ssh/id_ed25519_api" }
+    }
+  ]
+}

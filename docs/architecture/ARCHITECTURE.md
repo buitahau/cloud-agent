@@ -1,8 +1,9 @@
 # Architecture
 
-`cloud-agent` is a small Node/Express service. A caller submits a prompt; the service pulls the latest
-commit of a target repo into a single workspace, runs `claude -p` headless inside it, and exposes the
-job's status, result and live progress over HTTP.
+`cloud-agent` is a small Node/Express service. A caller submits a prompt for one of the configured repos;
+the service pulls the latest commit of that repo into the repo's own workspace, runs `claude -p` headless
+inside it, and exposes the job's status, result and live progress over HTTP. A read-only admin dashboard
+shows every repo's health and jobs.
 
 Sequence diagrams: [diagram/sequence-diagram.md](diagram/sequence-diagram.md).
 
@@ -10,38 +11,49 @@ Sequence diagrams: [diagram/sequence-diagram.md](diagram/sequence-diagram.md).
 
 ```mermaid
 flowchart LR
-    Client([Client]) -->|"POST /run-agent<br/>GET /run-agent/:id<br/>GET /run-agent/:id/events (SSE)"| Server
+    Client([Client]) -->|"POST /&lt;repo&gt;/run-agent<br/>GET /&lt;repo&gt;/run-agent[/:id[/events]]<br/>GET /repos"| Server
+    Admin([Admin browser]) -->|"/admin/ (Basic auth)<br/>/admin/api/*, SSE"| AdminR
 
     subgraph Service["cloud-agent (single Node process)"]
-        Server["server.js<br/>Express + x-api-key auth"]
-        Store[("jobStore.js<br/>jobs, log ring,<br/>event ring, subscribers")]
-        Worker["worker.js<br/>FIFO queue, 1 job at a time"]
-        Git["gitSync.js<br/>clone / fetch / reset / clean"]
+        Server["server.js<br/>Express + x-api-key auth<br/>repo routing, SSE"]
+        AdminR["admin.js<br/>dashboard + JSON API"]
+        Store[("jobStore.js<br/>jobs, history, log ring,<br/>event ring, subscribers")]
+        Persist[("jobPersistence.js<br/>JOBS_FILE (JSONL)")]
+        Worker["worker.js<br/>FIFO, 1 job per repo,<br/>MAX_CONCURRENT_JOBS"]
+        Registry["repoRegistry.js<br/>repos + one gitSync each,<br/>derived health"]
+        Git["gitSync.js<br/>clone / origin check /<br/>fetch / reset / clean"]
         Runner["claudeRunner.js<br/>stream-json -> events"]
         Proc["lib/processRunner.js<br/>spawn, timeout, kill group"]
     end
 
-    Server -->|create / get / subscribe| Store
+    Server -->|create / get / query / subscribe| Store
     Server -->|enqueue id| Worker
+    AdminR -->|list / query / readLog| Store
+    AdminR -->|status| Registry
+    Store -->|onPersist snapshot| Persist
     Worker -->|transition / appendLog / appendEvent| Store
-    Worker --> Git
+    Worker -->|"get(repo_id)"| Registry
+    Registry --> Git
     Worker --> Runner
     Git --> Proc
     Runner --> Proc
-    Git -->|git| Origin[(Origin repo<br/>REPO_URL)]
-    Git --> WS[("WORKSPACE_DIR<br/>local clone")]
-    Proc -->|"claude -p ... (cwd = workspace)"| CLI["claude CLI<br/>machine login"]
+    Git -->|git| Origin[(Origin repos<br/>from REPOS_FILE)]
+    Git --> WS[("workspaces/&lt;id&gt;<br/>one clone per repo")]
+    Proc -->|"claude -p ... (cwd = repo workspace)"| CLI["claude CLI<br/>machine login"]
     CLI --> WS
 ```
 
 | Module | Responsibility |
 |---|---|
-| `src/index.js` | Load config, check Claude login, wire modules, listen, graceful shutdown. |
-| `src/config.js` | Parse and validate env (`REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR`, `API_KEY`, ...). |
-| `src/server.js` | HTTP routes, `x-api-key` auth, SSE endpoint (`formatSse`, replay, heartbeat, `closeStreams`). |
-| `src/jobStore.js` | In-memory jobs; the **only** code allowed to change status. Also holds the per-job log ring and event ring (default 2000) with subscribers. |
-| `src/worker.js` | FIFO queue; runs exactly one job at a time against the single workspace. |
-| `src/gitSync.js` | Bring the workspace to a pristine checkout of `origin/<branch>`; report the short commit. |
+| `src/index.js` | Load config, check Claude login, load the jobs file, wire modules, listen, graceful shutdown. |
+| `src/config.js` | Parse and validate env and the repos file (`REPOS_FILE`): ids, URLs, per-repo credentials, workspace paths. |
+| `src/repoRegistry.js` | The configured repos, one `gitSync` each; repo health/status derived from job history. |
+| `src/server.js` | API routes (`/repos`, `/<repo>/run-agent...`), `x-api-key` auth, `createSseHandler` (shared with admin), `closeStreams`. |
+| `src/admin.js` + `src/admin/public/` | Read-only dashboard (static HTML/JS) and its JSON API, behind HTTP Basic auth. |
+| `src/jobStore.js` | In-memory jobs; the **only** code allowed to change status. Status history, listing/paging, retention, per-job log ring and event ring with subscribers, snapshot/hydrate for persistence. |
+| `src/jobPersistence.js` | Optional append-only JSONL of job snapshots (`JOBS_FILE`), compacted atomically. |
+| `src/worker.js` | Scheduler: global FIFO, at most one job per repo, at most `MAX_CONCURRENT_JOBS` overall. |
+| `src/gitSync.js` | Bring a repo's workspace to a pristine checkout of `origin/<branch>`; refuse a workspace cloned from another repo; report the short commit. |
 | `src/claudeRunner.js` | Run `claude -p --output-format stream-json --verbose`, map each NDJSON line to a live event (`toEvents`), classify the outcome. |
 | `src/lib/processRunner.js` | The only place that spawns processes: timeout, abort, process-group kill, output capture. |
 | `src/claudeAuth.js` | Startup check that the machine is logged in to a Claude subscription. |
@@ -50,9 +62,9 @@ flowchart LR
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: POST /run-agent
-    queued --> pulling: worker picks the job
-    queued --> failed: shutdown before start
+    [*] --> queued: POST /<repo>/run-agent
+    queued --> pulling: worker picks the job (its repo is free)
+    queued --> failed: shutdown / restart before start / unknown repo
     pulling --> running: git sync ok
     pulling --> failed: git error / shutdown
     running --> succeeded: claude exit 0, is_error=false
@@ -63,24 +75,29 @@ stateDiagram-v2
     timeout --> [*]
 ```
 
-Every transition is recorded by `jobStore.transition`, which also emits a `status` event; entering a
-terminal state additionally emits the terminal `result` event.
+Every transition is recorded by `jobStore.transition`, which appends to the job's `history`, emits a
+`status` event and (with `JOBS_FILE`) persists a snapshot; entering a terminal state additionally emits the
+terminal `result` event. Jobs that were not finished when the process died are loaded back as `failed`.
 
 ## Request flow
 
-1. **Submit.** `POST /run-agent` validates the body, creates a `queued` job, enqueues its id and returns
-   `202 {id, status}` immediately (it never waits for the run).
-2. **Pull.** The worker moves the job to `pulling`. `gitSync` clones on first use, then fetches
-   `origin/<branch>` and does checkout / reset / clean so every run starts from a pristine tree.
-3. **Run.** The job moves to `running`. `claudeRunner` spawns `claude -p` with the prompt on stdin and
-   `cwd = WORKSPACE_DIR`, so the repo's own `.claude/` agents, skills and commands apply.
-4. **Stream.** Each stdout line of the stream-json output becomes a live event
+1. **Submit.** `POST /<repo>/run-agent` checks the API key, then that `<repo>` is configured (else 404),
+   validates the body, creates a `queued` job with `repo_id` and the branch (default: the repo's
+   `defaultBranch`), enqueues its id and returns `202 {id, status}` immediately (it never waits for the run).
+2. **Schedule.** The worker walks its FIFO and starts every job whose repo is not busy, up to
+   `MAX_CONCURRENT_JOBS`. A job behind a busy repo keeps its place; other repos' jobs go ahead of it.
+3. **Pull.** The job moves to `pulling`. The repo's `gitSync` clones on first use (otherwise checks that the
+   workspace's `origin` is this repo), then fetches `origin/<branch>` and does checkout / reset / clean so
+   every run starts from a pristine tree.
+4. **Run.** The job moves to `running`. `claudeRunner` spawns `claude -p` with the prompt on stdin and
+   `cwd = workspaces/<repo>`, so the repo's own `.claude/` agents, skills and commands apply.
+5. **Stream.** Each stdout line of the stream-json output becomes a live event
    (`init`, `thinking`, `assistant_text`, `tool_use`, `tool_result`) appended to the job's event ring;
    git/stderr lines become `log` events.
-5. **Finish.** The final `result` line decides the outcome (`succeeded` / `failed` / `timeout`). The
+6. **Finish.** The final `result` line decides the outcome (`succeeded` / `failed` / `timeout`). The
    store emits the terminal `result` event and SSE streams close.
-6. **Observe.** Clients either poll `GET /run-agent/:id` (status, result, `logs_tail`) or subscribe to
-   `GET /run-agent/:id/events` for live progress.
+7. **Observe.** Clients either poll `GET /<repo>/run-agent/:id` (status, result, `logs_tail`) or subscribe to
+   `GET /<repo>/run-agent/:id/events` for live progress. Admins use the dashboard.
 
 ## Live progress (SSE)
 
@@ -101,22 +118,37 @@ flowchart LR
 - **Termination:** the stream ends right after the `result` event; a finished job replays and closes.
 - **Safety:** `: ping` heartbeat every 15 s, slow readers are dropped (they resume via
   `Last-Event-ID`), `X-Accel-Buffering: no` for proxies, `app.closeStreams()` on shutdown.
-- **Auth:** same `x-api-key` header as the other routes, so browsers must use `fetch()` with a streaming
-  reader rather than `EventSource`.
+- **Auth:** the API stream uses the same `x-api-key` header as the other routes, so browsers must use
+  `fetch()` with a streaming reader. The dashboard's copy (`/admin/api/jobs/:id/events`, same handler) is
+  behind Basic auth, which browsers resend automatically, so it uses plain `EventSource`.
+
+## Admin dashboard
+
+- Static page (`src/admin/public`), hash routing, no build step. Lists poll every 5 s; job detail uses SSE.
+- All job text (prompts, logs, tool output, results) is untrusted and rendered with `textContent` only.
+- Repo health is derived, not stored: the newest job that entered `pulling` decides it (`running` next =
+  `ok`, `failed` next = `sync_error`, still pulling = `syncing`, none = `never_synced`).
+- Not mounted unless `ADMIN_PASSWORD` is set. Read-only; CSP `default-src 'self'`, `frame-ancestors 'none'`,
+  `Cache-Control: no-store` on the API.
 
 ## Key design decisions
 
 | Decision | Reason |
 |---|---|
-| One job at a time, one workspace | Two jobs pulling/running in the same folder would interfere. Scale-out = a worktree/clone per job. |
+| One clone per repo, one job per repo at a time | Two jobs in the same folder would interfere. Different repos are independent, so they may run in parallel (`MAX_CONCURRENT_JOBS`, default 1). Parallel jobs on the same repo would need a worktree per job (future work). |
+| Repos come from a file, not an API | Repo URLs stay operator input (git URLs like `ext::` can run commands), secrets never travel over HTTP, and no repo can disappear while a job runs on it. |
+| A credential per repo, no shared fallback | A shared token would be sent to every repo's host. Tokens are referenced by env-var name and scoped to the repo's own origin; `GIT_ALLOW_PROTOCOL=https:ssh:file`. |
+| Repo in the URL path | Every request says which repo it targets; a job is only visible under its own repo. |
+| Basic auth for the dashboard | Separate secret from `API_KEY`; the browser prompts and resends it (also for `EventSource`), so no login page or sessions. |
 | `claude` runs in its own process group | A timeout or shutdown kills the whole tree (bash tools, test runners, subagents). |
 | Subscription login, not API key | `ANTHROPIC_API_KEY` / OAuth env vars are stripped from the child env so the machine login is always used. |
 | Prompt on stdin | Avoids argv limits and prompts starting with `-` being parsed as flags. |
-| In-memory state | PoC scope. A restart loses jobs and events; persistence is future work. |
+| JSONL job file, no database | No dependency, works on Node 18; filtering happens in memory (fine for thousands of jobs). Live events are not persisted. |
 | Result taken from the stream | The `result` line is captured while streaming, so the 10 MB capture cap can't lose it. |
 
 ## Configuration
 
-See `.env.example`. Relevant to this flow: `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR`,
-`GIT_SSH_KEY_PATH` / `GIT_TOKEN`, `CLAUDE_PERMISSION_MODE`, `CLAUDE_MAX_TURNS`, `JOB_TIMEOUT_SECONDS`,
-`PORT`, `API_KEY`.
+See `.env.example` and `repos.example.json`. Relevant to this flow: `REPOS_FILE` (repos, per-repo
+`auth.tokenEnv` / `auth.sshKeyPath`, `workspaceRoot`), the `GIT_TOKEN_*` vars it references,
+`MAX_CONCURRENT_JOBS`, `JOBS_FILE`, `JOB_RETENTION_MAX`, `ADMIN_USER` / `ADMIN_PASSWORD`,
+`CLAUDE_PERMISSION_MODE`, `CLAUDE_MAX_TURNS`, `JOB_TIMEOUT_SECONDS`, `PORT`, `API_KEY`.

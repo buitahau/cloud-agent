@@ -6,7 +6,9 @@ import 'dotenv/config'; // populates process.env from ./.env (does not override 
 import { loadConfig, redactConfig, ConfigError } from './config.js';
 import { checkClaudeAuth, ClaudeAuthError } from './claudeAuth.js';
 import { createJobStore } from './jobStore.js';
-import { createGitSync } from './gitSync.js';
+import { createRepoRegistry } from './repoRegistry.js';
+import { createJobPersistence } from './jobPersistence.js';
+import { createAdminRouter } from './admin.js';
 import { createClaudeRunner } from './claudeRunner.js';
 import { createWorker } from './worker.js';
 import { createApp, startServer } from './server.js';
@@ -22,11 +24,15 @@ import { createApp, startServer } from './server.js';
  *  3. auth = await checkClaudeAuth({ claudeBin, probe: config.claudeAuthProbe })
  *       ClaudeAuthError -> console.error(err.message); process.exit(1)
  *     console.log(`Claude auth OK (${auth.authMethod}, ${auth.version}${auth.probed ? ', probe passed' : ', probe skipped'})`)
- *  4. store  = createJobStore({ logsTailLines: config.logsTailLines })
- *     gitSync = createGitSync({ repoUrl, workspaceDir, sshKeyPath: gitSshKeyPath, token: gitToken, timeoutMs: gitTimeoutMs })
- *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs })
- *     worker = createWorker({ store, gitSync, claudeRunner: runner, workspaceDir })
- *     app    = createApp({ config, store, worker })
+ *  4. persistence = JOBS_FILE ? createJobPersistence(...) : null
+ *     store  = createJobStore({ logsTailLines, retentionMax: jobRetentionMax, onPersist: persistence?.append })
+ *     if persistence: store.hydrate(persistence.load()); persistence.compact(...)
+ *       console.log(`Jobs file: <file> (<n> jobs loaded, <m> interrupted)`)
+ *     repos  = createRepoRegistry(config.repos, { gitTimeoutMs })   (one GitSync per repo)
+ *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs })   (shared)
+ *     worker = createWorker({ store, repos, claudeRunner: runner, maxConcurrent: maxConcurrentJobs })
+ *     app    = createApp({ config, store, worker, repos, adminRouter? })   (admin only if ADMIN_PASSWORD is set)
+ *     console.log(`Repos: <id>, <id>`) and `Admin dashboard: /admin/` or `Admin dashboard: disabled ...`
  *  5. server = await startServer(app, config.port)
  *     console.log(`Listening on :${server.address().port}`)
  *  6. SIGINT/SIGTERM (once): console.log('Shutting down'); server.close(); await worker.shutdown();
@@ -34,8 +40,8 @@ import { createApp, startServer } from './server.js';
  *     outlive us.
  *  7. process.on('unhandledRejection') -> console.error, do NOT exit (service must stay up, T9).
  *
- * The workspace is NOT cloned at startup; the first job clones it (keeps startup fast, and a bad
- * REPO_URL shows up as a failed job per T9 instead of a crash).
+ * Workspaces are NOT cloned at startup; a repo's first job clones it (keeps startup fast, and a bad
+ * repo URL shows up as a failed job per T9 instead of a crash).
  *
  * @returns {Promise<void>}
  */
@@ -79,22 +85,47 @@ export async function main() {
   console.log(`Claude auth OK (${auth.authMethod}, ${auth.version}${auth.probed ? ', probe passed' : ', probe skipped'})`);
 
   // 4. wiring
-  const store = createJobStore({ logsTailLines: config.logsTailLines });
-  const gitSync = createGitSync({
-    repoUrl: config.repoUrl,
-    workspaceDir: config.workspaceDir,
-    sshKeyPath: config.gitSshKeyPath,
-    token: config.gitToken,
-    timeoutMs: config.gitTimeoutMs,
+  /** @type {ReturnType<typeof createJobPersistence>|null} */
+  let persistence = null;
+  /** @type {ReturnType<typeof createJobStore>} */
+  let store;
+  if (config.jobsFile) {
+    persistence = createJobPersistence({
+      file: config.jobsFile,
+      getSnapshots: () => store.list().map((j) => store.snapshot(j)),
+      compactAfterLines: Math.max(2000, config.jobRetentionMax * 2),
+    });
+  }
+  store = createJobStore({
+    logsTailLines: config.logsTailLines,
+    retentionMax: config.jobRetentionMax,
+    onPersist: persistence ? (snap) => persistence.append(snap) : undefined,
   });
+  if (persistence) {
+    const { loaded, interrupted } = store.hydrate(persistence.load());
+    persistence.compact(store.list().map((j) => store.snapshot(j)));
+    console.log(`Jobs file: ${config.jobsFile} (${loaded} jobs loaded, ${interrupted} interrupted)`);
+  }
+  const repos = createRepoRegistry(config.repos, { gitTimeoutMs: config.gitTimeoutMs });
   const runner = createClaudeRunner({
     claudeBin: config.claudeBin,
     permissionMode: config.claudePermissionMode,
     maxTurns: config.claudeMaxTurns,
     timeoutMs: config.jobTimeoutMs,
   });
-  const worker = createWorker({ store, gitSync, claudeRunner: runner, workspaceDir: config.workspaceDir });
-  const app = createApp({ config, store, worker });
+  const worker = createWorker({ store, repos, claudeRunner: runner, maxConcurrent: config.maxConcurrentJobs });
+  const adminRouter = config.adminPassword
+    ? createAdminRouter({
+      config: { adminUser: config.adminUser, adminPassword: config.adminPassword },
+      store,
+      worker,
+      repos,
+      persistence: Boolean(persistence),
+    })
+    : undefined;
+  const app = createApp({ config, store, worker, repos, adminRouter });
+  console.log(`Repos: ${repos.ids().join(', ')} (max ${config.maxConcurrentJobs} concurrent job${config.maxConcurrentJobs === 1 ? '' : 's'})`);
+  console.log(adminRouter ? 'Admin dashboard: /admin/' : 'Admin dashboard: disabled (set ADMIN_PASSWORD to enable)');
 
   // 5. listen
   const server = await startServer(app, config.port);

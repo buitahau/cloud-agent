@@ -1,14 +1,15 @@
 // Covers: T3, T5, T6, T7, T8 against the REAL claude CLI and a REAL target repo. Opt-in: E2E=1 (npm run test:e2e).
-// Reads the project's .env (dotenv) for REPO_URL / tokens. Costs subscription usage. T7/T8 assertions are
+// Reads the project's .env (dotenv) + REPOS_FILE for the target repo and its token. Costs subscription usage. T7/T8 assertions are
 // heuristic (result text mentions the agent/skill) — confirm manually via logs_tail as well.
 //
 // How it runs: spawns `node src/index.js` with cwd = project root (so dotenv loads the real .env), PORT=0,
 // then drives it over HTTP exactly like a caller would.
 //
 // Optional knobs (env):
+//   E2E_REPO=<id>                    repo id from REPOS_FILE to test against (default: the first repo)
 //   E2E_BRANCHES=main,dev            branches for T6 (both must exist on origin)
-//   E2E_MARKER_CONTENT=<text>        T5: expected content of MARKER.txt on REPO_BRANCH (push it first). If unset,
-//                                    T5 only checks that `commit` equals `git ls-remote` HEAD of REPO_BRANCH.
+//   E2E_MARKER_CONTENT=<text>        T5: expected content of MARKER.txt on the repo's defaultBranch (push it first). If unset,
+//                                    T5 only checks that `commit` equals `git ls-remote` HEAD of that branch.
 //   E2E_T7_EXPECT=<regex>            T7: regex the result must match (default /test|pass|fail/i)
 //   E2E_T8_PROMPT=<prompt>           T8: prompt that triggers a repo skill / slash command (T8 skipped if unset)
 //   E2E_T8_EXPECT=<regex>            T8: regex matched against result + logs_tail
@@ -29,6 +30,8 @@ let service = null;
 let base = '';
 let apiKey = '';
 let config = null;
+/** @type {import('../src/config.js').RepoConfig|null} */
+let repo = null;
 let serviceLog = '';
 
 before(async () => {
@@ -38,6 +41,8 @@ before(async () => {
   const { loadConfig } = await import('../src/config.js');
   config = loadConfig({ ...parsed, ...process.env }, { cwd: ROOT });
   apiKey = config.apiKey;
+  repo = process.env.E2E_REPO ? config.repos.find((r) => r.id === process.env.E2E_REPO) : config.repos[0];
+  if (!repo) throw new Error(`E2E_REPO "${process.env.E2E_REPO}" is not in ${config.reposFile}`);
 
   service = spawn(process.execPath, [path.join(ROOT, 'src', 'index.js')], {
     cwd: ROOT,
@@ -63,7 +68,7 @@ after(async () => {
 });
 
 async function submit(body) {
-  const res = await fetch(`${base}/run-agent`, {
+  const res = await fetch(`${base}/${repo.id}/run-agent`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': apiKey },
     body: JSON.stringify(body),
@@ -79,7 +84,7 @@ async function waitJob(id) {
   const seen = [];
   const end = Date.now() + JOB_WAIT_MS;
   while (Date.now() < end) {
-    const res = await fetch(`${base}/run-agent/${id}`, { headers: { 'x-api-key': apiKey } });
+    const res = await fetch(`${base}/${repo.id}/run-agent/${id}`, { headers: { 'x-api-key': apiKey } });
     assert.equal(res.status, 200);
     const job = await res.json();
     if (seen[seen.length - 1] !== job.status) seen.push(job.status);
@@ -96,8 +101,8 @@ async function remoteHead(branch) {
   const { runProcess } = await import('../src/lib/processRunner.js');
   const r = await runProcess({
     cmd: 'git',
-    args: ['ls-remote', '--', config.repoUrl, `refs/heads/${branch}`],
-    env: buildGitEnv({ baseEnv: process.env, repoUrl: config.repoUrl, sshKeyPath: config.gitSshKeyPath, token: config.gitToken }),
+    args: ['ls-remote', '--', repo.url, `refs/heads/${branch}`],
+    env: buildGitEnv({ baseEnv: process.env, repoUrl: repo.url, sshKeyPath: repo.sshKeyPath, token: repo.token }),
     timeoutMs: 60_000,
   });
   assert.equal(r.code, 0, r.stderr);
@@ -117,8 +122,8 @@ test('T3: "say hello" job reaches succeeded with non-empty result', T, async () 
   assert.deepEqual(idx, [...idx].sort((a, b) => a - b), `status order ${seen.join(' -> ')}`);
 });
 
-test('T5: push MARKER.txt to REPO_BRANCH (manual precondition), prompt asks for its content -> result contains it', T, async () => {
-  const head = await remoteHead(config.repoBranch);
+test('T5: push MARKER.txt to the repo\'s default branch (manual precondition), prompt asks for its content -> result contains it', T, async () => {
+  const head = await remoteHead(repo.defaultBranch);
   const id = await submit({ prompt: 'What is the content of MARKER.txt? Reply with the content only.' });
   const { job } = await waitJob(id);
   assert.equal(job.status, 'succeeded', explain(job));
