@@ -125,7 +125,8 @@ export function createWorker(deps) {
  *     store.update(id, { commit })
  *     (if aborted during pulling -> 'failed' with error 'Service shutting down')
  *  3. store.transition(id, 'running')
- *  4. out = await claudeRunner.run({ prompt: job.prompt, cwd: workspaceDir, log: line => store.appendLog(id, line), signal })
+ *  4. out = await claudeRunner.run({ prompt: job.prompt, cwd: workspaceDir, log: line => store.appendLog(id, line),
+ *                                   onEvent: (type, data) => store.appendEvent(id, type, data), signal })
  *  5. store.transition(id, out.outcome, { result: out.result, error: out.error, claude: out.meta })
  *  Any unexpected exception anywhere: if job not terminal -> transition to 'failed' with
  *  error `Internal error: ${e.message}`; log stack via logger.error.
@@ -139,6 +140,7 @@ export async function processJob(deps, id, signal) {
   const { store, gitSync, claudeRunner, workspaceDir } = deps;
   const logger = deps.logger ?? console;
   const log = (line) => store.appendLog(id, line);
+  const onEvent = (type, data) => store.appendEvent(id, type, data);
   try {
     const job = store.get(id);
     if (!job) {
@@ -173,7 +175,7 @@ export async function processJob(deps, id, signal) {
     }
 
     store.transition(id, STATUS.RUNNING);
-    const out = await claudeRunner.run({ prompt: job.prompt, cwd: workspaceDir, log, signal });
+    const out = await claudeRunner.run({ prompt: job.prompt, cwd: workspaceDir, log, onEvent, signal });
     store.transition(id, out.outcome, { result: out.result, error: out.error, claude: out.meta });
   } catch (err) {
     logger.error(`[worker] job ${id} internal error:`, err);

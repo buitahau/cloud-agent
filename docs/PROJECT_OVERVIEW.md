@@ -189,7 +189,7 @@ Running Claude with the repo as its working directory makes it load `.claude/age
 | Permissions | `bypassPermissions`, because nobody is present to approve tool calls. Run it in a container or VM. | Restrict with `--allowedTools` / `.claude/settings.json` allow-lists. |
 | Persistence | Job state in memory. | SQLite / Postgres; store full transcripts. |
 | Auth on API | One static `API_KEY` header. | Proper auth / per-user tokens. |
-| Output | Final `result` text from `--output-format json`. | Stream progress with `--output-format stream-json`; webhooks instead of polling. |
+| Output | Final `result` text, plus live progress over SSE (`GET /run-agent/:id/events`) from `--output-format stream-json`. Events are kept in memory (last 2000 per job). | Persist transcripts; webhooks. |
 | Subscription usage | Use the subscription already logged in on this machine. | Check that automated, shared use fits your plan's terms; switch to an API key (`ANTHROPIC_API_KEY`) or a Team/Enterprise plan for production. |
 
 ---

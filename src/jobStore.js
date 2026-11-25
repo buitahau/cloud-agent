@@ -46,6 +46,15 @@ export const TRANSITIONS = Object.freeze({
  */
 
 /**
+ * One live event of a job (SSE payload). `seq` is monotonic per job, starting at 1.
+ * @typedef {Object} JobEvent
+ * @property {number} seq
+ * @property {string} type    status | log | init | assistant_text | thinking | tool_use | tool_result | result | ...
+ * @property {string} at      ISO-8601
+ * @property {object} data
+ */
+
+/**
  * Internal job record. Field names match the API contract (spec §5) exactly.
  * @typedef {Object} Job
  * @property {string}          id           "job_" + 32 lowercase hex chars (randomUUID without dashes)
@@ -106,6 +115,13 @@ export class IllegalTransitionError extends Error {
  *           Patch non-status fields. Throws if patch contains `status` or any key outside the allowed four.
  * @property {(id: string, text: string) => void} appendLog
  *           Push text into the job's LogBuffer. Unknown id -> silently ignore (logging must never throw).
+ * @property {(id: string, type: string, data?: object) => JobEvent|null} appendEvent
+ *           Record a live event (assistant_text, tool_use, ...) in the job's bounded event ring and push it to
+ *           subscribers. Unknown id -> null. Never throws. appendLog / transition also emit 'log' / 'status' (+ 'result').
+ * @property {(id: string, afterSeq?: number) => { events: JobEvent[], dropped: number }|null} readEvents
+ *           Buffered events with seq > afterSeq, plus how many were already evicted from the ring. null if no such job.
+ * @property {(id: string, fn: (evt: JobEvent) => void) => (() => void)|null} subscribe
+ *           Live events appended after this call. Returns an unsubscribe fn (null if no such job).
  * @property {(job: Job) => PublicJob} toPublic
  * @property {() => Job[]} list    all jobs, creation order (for debugging/tests)
  */
@@ -116,6 +132,7 @@ export class IllegalTransitionError extends Error {
  * @param {() => string} [opts.genId]         default () => 'job_' + randomUUID().replace(/-/g, '')
  * @param {number}       [opts.logsTailLines] default 50 — lines returned in logs_tail
  * @param {number}       [opts.logCapacity]   default 500 — lines kept per job
+ * @param {number}       [opts.eventCapacity] default 2000 — live events kept per job (for SSE replay)
  * @returns {JobStore}
  */
 const PATCH_KEYS = Object.freeze(['commit', 'result', 'error', 'claude']);
@@ -125,6 +142,23 @@ export function createJobStore(opts = {}) {
   const genId = opts.genId ?? (() => 'job_' + randomUUID().replace(/-/g, ''));
   const logsTailLines = opts.logsTailLines ?? 50;
   const logCapacity = opts.logCapacity ?? 500;
+  const eventCapacity = opts.eventCapacity ?? 2000;
+  /** @type {Map<string, { events: JobEvent[], nextSeq: number, subs: Set<(e: JobEvent) => void> }>} */
+  const streams = new Map();
+
+  const emit = (id, type, data = {}) => {
+    const st = streams.get(id);
+    if (!st) return null;
+    /** @type {JobEvent} */
+    // wall clock, not the injected now(): job timestamps stay deterministic under test clocks
+    const evt = { seq: st.nextSeq++, type, at: new Date().toISOString(), data };
+    st.events.push(evt);
+    if (st.events.length > eventCapacity) st.events.shift();
+    for (const fn of [...st.subs]) {
+      try { fn(evt); } catch { /* a bad subscriber must never break the job */ }
+    }
+    return evt;
+  };
   /** @type {Map<string, Job>} */
   const jobs = new Map();
 
@@ -162,6 +196,7 @@ export function createJobStore(opts = {}) {
         log: new LogBuffer(logCapacity),
       };
       jobs.set(id, job);
+      streams.set(id, { events: [], nextSeq: 1, subs: new Set() });
       return job;
     },
 
@@ -179,6 +214,12 @@ export function createJobStore(opts = {}) {
       if (to === STATUS.PULLING) job.started_at = now().toISOString();
       if (TERMINAL_STATUSES.has(to)) job.finished_at = now().toISOString();
       job.log.push(`[job] ${from} -> ${to}`);
+      emit(id, 'status', { status: to, from });
+      if (TERMINAL_STATUSES.has(to)) {
+        // Terminal marker: SSE streams close after this event.
+        emit(id, 'result', { status: to, result: job.result, error: job.error, claude: job.claude ? { ...job.claude } : null });
+        streams.get(id)?.subs.clear();
+      }
       return job;
     },
 
@@ -192,6 +233,29 @@ export function createJobStore(opts = {}) {
       const job = jobs.get(id);
       if (!job) return;
       try { job.log.push(text); } catch { /* logging must never throw */ }
+      try { emit(id, 'log', { line: String(text) }); } catch { /* ditto */ }
+    },
+
+    appendEvent(id, type, data) {
+      try { return emit(id, type, data ?? {}); } catch { return null; }
+    },
+
+    readEvents(id, afterSeq = 0) {
+      const st = streams.get(id);
+      if (!st) return null;
+      const after = Number.isFinite(afterSeq) && afterSeq > 0 ? Math.floor(afterSeq) : 0;
+      const firstSeq = st.events.length ? st.events[0].seq : st.nextSeq;
+      return {
+        events: st.events.filter((e) => e.seq > after),
+        dropped: Math.max(0, firstSeq - after - 1),
+      };
+    },
+
+    subscribe(id, fn) {
+      const st = streams.get(id);
+      if (!st) return null;
+      st.subs.add(fn);
+      return () => { st.subs.delete(fn); };
     },
 
     toPublic(job) {

@@ -67,9 +67,41 @@ watch -n 2 "curl -s -H 'x-api-key: $API_KEY' localhost:8080/run-agent/$ID | jq '
 
 # full log tail of a job
 curl -s -H "x-api-key: $API_KEY" localhost:8080/run-agent/$ID | jq -r .logs_tail
+
+# live progress (Server-Sent Events); -N disables curl's buffering
+curl -N -H "x-api-key: $API_KEY" localhost:8080/run-agent/$ID/events
 ```
 
 Jobs run one at a time (FIFO) against a single workspace and are kept in memory only (lost on restart).
+
+### Live progress (SSE)
+
+`GET /run-agent/{id}/events` streams what the agent is doing while the job runs. Frames look like
+`id: 7\nevent: tool_use\ndata: {"id":"toolu_..","name":"Bash","input":{...}}`. Event types:
+
+| event | data |
+|---|---|
+| `status` | `{status, from}` on every transition |
+| `log` | `{line}` — git / stderr / `[claude]` lines (same as `logs_tail`) |
+| `init` | `{session_id, model, tools}` |
+| `assistant_text` | `{text, truncated}` |
+| `thinking` | `{text, truncated, redacted}` — only when the model emits thinking; may be summarized/redacted |
+| `tool_use` | `{id, name, input}` |
+| `tool_result` | `{tool_use_id, is_error, text, truncated}` (text clipped to 4000 chars) |
+| `result` | `{status, result, error, claude}` — **terminal**: the server closes the stream after it |
+| `gap` | `{dropped}` — events evicted from the 2000-event buffer before you (re)connected |
+
+Reconnect with `Last-Event-ID: <last id>` (or `?since=<id>`) to resume without losing events; a finished
+job replays its buffered events and closes. Browsers' `EventSource` cannot send the `x-api-key` header, so
+use `fetch` with a streaming reader (or `@microsoft/fetch-event-source`):
+
+```js
+const res = await fetch(`/run-agent/${id}/events`, { headers: { 'x-api-key': KEY } });
+const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+// split on "\n\n", parse `event:` / `data:` lines
+```
+
+If you put a reverse proxy in front, disable response buffering (the service already sends `X-Accel-Buffering: no`).
 
 ## Tests
 

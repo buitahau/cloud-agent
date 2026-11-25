@@ -163,3 +163,140 @@ test('startServer rejects on EADDRINUSE', async () => {
     await assert.rejects(startServer(app, s1.address().port, '127.0.0.1'), /EADDRINUSE/);
   } finally { await new Promise((r) => s1.close(r)); }
 });
+
+// ---- SSE: GET /run-agent/:id/events ----------------------------------------------------------------------
+
+/** Read an SSE response to completion (or until `until(frames)` is true) and parse the frames. */
+async function readSse(res, until) {
+  const frames = [];
+  const dec = new TextDecoder();
+  let buf = '';
+  const reader = res.body.getReader();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const f = { raw };
+      for (const l of raw.split('\n')) {
+        if (l.startsWith('id: ')) f.id = Number(l.slice(4));
+        else if (l.startsWith('event: ')) f.event = l.slice(7);
+        else if (l.startsWith('data: ')) f.data = JSON.parse(l.slice(6));
+      }
+      frames.push(f);
+    }
+    if (until?.(frames)) { await reader.cancel(); break; }
+  }
+  return frames;
+}
+
+test('SSE: 401 without key, 404 unknown job', async () => {
+  await withServer(async ({ base }) => {
+    assert.equal((await get(base, '/run-agent/job_x/events', {})).status, 401);
+    const res = await get(base, '/run-agent/job_x/events');
+    assert.equal(res.status, 404);
+    assert.deepEqual(await res.json(), { error: 'job not found' });
+  });
+});
+
+test('SSE: finished job -> headers, full replay, stream ends after the result event; Last-Event-ID resumes', async () => {
+  await withServer(async ({ base, store }) => {
+    const job = store.create({ prompt: 'p', branch: 'b' });
+    store.transition(job.id, 'pulling');
+    store.appendEvent(job.id, 'assistant_text', { text: 'hi' });
+    store.transition(job.id, 'running');
+    store.transition(job.id, 'succeeded', { result: 'all done' });
+
+    const res = await get(base, `/run-agent/${job.id}/events`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /^text\/event-stream/);
+    assert.match(res.headers.get('cache-control'), /no-cache/);
+    assert.equal(res.headers.get('x-accel-buffering'), 'no');
+    const frames = (await readSse(res)).filter((f) => f.event); // drops the "retry:" preamble
+    assert.deepEqual(frames.map((f) => f.event), ['status', 'assistant_text', 'status', 'status', 'result']);
+    assert.deepEqual(frames.map((f) => f.id), [1, 2, 3, 4, 5]);
+    assert.equal(frames.at(-1).data.result, 'all done');
+
+    const resumed = await fetch(`${base}/run-agent/${job.id}/events`, { headers: { 'x-api-key': KEY, 'last-event-id': '3' } });
+    const rf = (await readSse(resumed)).filter((f) => f.event);
+    assert.deepEqual(rf.map((f) => f.id), [4, 5]);
+
+    const viaQuery = await get(base, `/run-agent/${job.id}/events?since=4`);
+    assert.deepEqual((await readSse(viaQuery)).filter((f) => f.event).map((f) => f.id), [5]);
+  });
+});
+
+test('SSE: evicted history -> gap event (no id) before the replay', async () => {
+  const store = createJobStore({ eventCapacity: 2 });
+  const app = createApp({ config: { repoBranch: 'dev', apiKey: KEY }, store, worker: { enqueue() {} }, logger: silent });
+  const server = await startServer(app, 0, '127.0.0.1');
+  try {
+    const job = store.create({ prompt: 'p', branch: 'b' });
+    store.transition(job.id, 'pulling');
+    store.transition(job.id, 'failed', { error: 'x' }); // status, status, result = 3 events -> ring keeps the last 2
+    const res = await get(`http://127.0.0.1:${server.address().port}`, `/run-agent/${job.id}/events`);
+    const frames = (await readSse(res)).filter((f) => f.event);
+    assert.equal(frames[0].event, 'gap');
+    assert.equal(frames[0].id, undefined);
+    assert.deepEqual(frames[0].data, { dropped: 1 });
+    assert.equal(frames.at(-1).event, 'result');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('SSE: live job -> events arrive as they happen, stream closes after the terminal result; heartbeat pings', async () => {
+  const store = createJobStore();
+  const app = createApp({ config: { repoBranch: 'dev', apiKey: KEY }, store, worker: { enqueue() {} }, logger: silent, sseHeartbeatMs: 30 });
+  const server = await startServer(app, 0, '127.0.0.1');
+  try {
+    const job = store.create({ prompt: 'p', branch: 'b' });
+    store.transition(job.id, 'pulling');
+    const res = await get(`http://127.0.0.1:${server.address().port}`, `/run-agent/${job.id}/events`);
+    const collected = readSse(res);
+    await new Promise((r) => setTimeout(r, 120)); // >= several heartbeats while nothing happens
+    store.transition(job.id, 'running');
+    store.appendEvent(job.id, 'tool_use', { name: 'Bash' });
+    store.transition(job.id, 'succeeded', { result: 'ok' });
+    const frames = await collected;
+    assert.ok(frames.some((f) => f.raw === ': ping'), 'expected at least one heartbeat comment');
+    const evs = frames.filter((f) => f.event).map((f) => f.event);
+    assert.deepEqual(evs, ['status', 'status', 'tool_use', 'status', 'result']);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('SSE: client disconnect unsubscribes; closeStreams() ends open streams', async () => {
+  const store = createJobStore();
+  const app = createApp({ config: { repoBranch: 'dev', apiKey: KEY }, store, worker: { enqueue() {} }, logger: silent });
+  const server = await startServer(app, 0, '127.0.0.1');
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const job = store.create({ prompt: 'p', branch: 'b' });
+    store.transition(job.id, 'pulling');
+    const ac = new AbortController();
+    const res = await fetch(`${base}/run-agent/${job.id}/events`, { headers: { 'x-api-key': KEY }, signal: ac.signal });
+    const first = res.body.getReader();
+    await first.read();
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 50));
+    // after the disconnect an append must not throw and nobody is subscribed any more
+    assert.doesNotThrow(() => store.appendEvent(job.id, 'log', {}));
+
+    const res2 = await get(base, `/run-agent/${job.id}/events`);
+    const done = readSse(res2);
+    await new Promise((r) => setTimeout(r, 50));
+    await app.closeStreams();
+    const frames = await done; // resolves because the server ended the stream
+    assert.ok(Array.isArray(frames)); // reaching here at all proves closeStreams() ended the response
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+  }
+});

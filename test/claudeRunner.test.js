@@ -25,7 +25,7 @@ const baseOpts = { claudeBin: FAKE_CLAUDE, permissionMode: 'bypassPermissions', 
 
 test('buildClaudeArgs exact vector (prompt NOT in argv)', () => {
   assert.deepEqual(buildClaudeArgs({ permissionMode: 'bypassPermissions', maxTurns: 50 }),
-    ['-p', '--output-format', 'json', '--permission-mode', 'bypassPermissions', '--max-turns', '50']);
+    ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions', '--max-turns', '50']);
 });
 
 test('buildClaudeEnv strips API key / auth token / OAuth token / nesting vars so the machine login is used; no mutation', () => {
@@ -111,7 +111,7 @@ test('T9 via fake: [[fake:error]] -> failed; logs include [claude] summary line'
   const out = await runner.run({ prompt: '[[fake:error]]', cwd: os.tmpdir(), log: (l) => lines.push(l) });
   assert.equal(out.outcome, 'failed');
   assert.match(out.error, /^claude reported an error \(error_during_execution\): fake failure/);
-  assert.equal(lines[0], `[claude] $ ${FAKE_CLAUDE} -p --output-format json --permission-mode bypassPermissions --max-turns 50`);
+  assert.equal(lines[0], `[claude] $ ${FAKE_CLAUDE} -p --output-format stream-json --verbose --permission-mode bypassPermissions --max-turns 50`);
   assert.ok(lines.some((l) => /^\[claude\] exit=1 subtype=error_during_execution turns=1 cost_usd=0 duration_ms=5$/.test(l)), lines.join('\n'));
 
   const g = [];
@@ -162,7 +162,7 @@ test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD show
     assert.equal(out.outcome, 'succeeded');
     assert.equal(out.result, work);
     const entry = JSON.parse(fs.readFileSync(rec, 'utf8').trim().split('\n').pop());
-    assert.deepEqual(entry.argv, ['-p', '--output-format', 'json', '--permission-mode', 'acceptEdits', '--max-turns', '7']);
+    assert.deepEqual(entry.argv, ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'acceptEdits', '--max-turns', '7']);
     assert.equal(entry.stdin, '-starts with dash [[fake:pwd]]');
     assert.equal(entry.cwd, work);
     assert.deepEqual(entry.env, { CLAUDE_CODE_OAUTH_TOKEN: null, ANTHROPIC_API_KEY: null, CLAUDECODE: null });
@@ -177,7 +177,7 @@ test('via fake: stderr lines are logged as "[claude:stderr] ..."', async () => {
   assert.equal(out.outcome, 'succeeded');
   assert.deepEqual(lines.filter((l) => l.startsWith('[claude:stderr]')),
     ['[claude:stderr] fake stderr line 1', '[claude:stderr] fake stderr line 2', '[claude:stderr] fake stderr line 3']);
-  // stdout JSON is not line-logged
+  // stdout stream-json lines become events, never log lines
   assert.ok(!lines.some((l) => l.startsWith('[claude:stdout]')));
 });
 
@@ -191,4 +191,49 @@ test('stub run: never rejects even if injected run throws; spawnError path', asy
   const out2 = await missing.run({ prompt: 'x', cwd: os.tmpdir() });
   assert.equal(out2.outcome, 'failed');
   assert.match(out2.error, /^Failed to start claude: .*ENOENT/);
+});
+
+test('toEvents: maps stream-json lines; truncates big text/input; ignores unknown shapes', async () => {
+  const { toEvents, MAX_EVENT_TEXT, MAX_EVENT_INPUT } = await import('../src/claudeRunner.js');
+  assert.deepEqual(toEvents({ type: 'system', subtype: 'init', session_id: 's', model: 'm', tools: ['Bash'] }),
+    [['init', { session_id: 's', model: 'm', tools: ['Bash'] }]]);
+  const evs = toEvents({ type: 'assistant', message: { content: [
+    { type: 'thinking', thinking: 'hmm' }, { type: 'redacted_thinking', data: 'xx' }, { type: 'text', text: 'hello' },
+    { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
+    { type: 'tool_use', id: 't2', name: 'Write', input: { content: 'x'.repeat(MAX_EVENT_INPUT + 10) } },
+    { type: 'image' },
+  ] } });
+  assert.deepEqual(evs.map((e) => e[0]), ['thinking', 'thinking', 'assistant_text', 'tool_use', 'tool_use']);
+  assert.deepEqual(evs[0][1], { text: 'hmm', truncated: false, redacted: false });
+  assert.equal(evs[1][1].redacted, true);
+  assert.deepEqual(evs[3][1], { id: 't1', name: 'Bash', input: { command: 'ls' } });
+  assert.equal(evs[4][1].input._truncated, true);
+  const tr = toEvents({ type: 'user', message: { content: [
+    { type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: 'y'.repeat(MAX_EVENT_TEXT + 5) }], is_error: true },
+  ] } });
+  assert.equal(tr[0][0], 'tool_result');
+  assert.equal(tr[0][1].is_error, true);
+  assert.equal(tr[0][1].truncated, true);
+  assert.equal(tr[0][1].text.length, MAX_EVENT_TEXT);
+  for (const junk of [null, 'x', 5, {}, { type: 'result' }, { type: 'assistant' }, { type: 'assistant', message: { content: 'str' } }]) {
+    assert.deepEqual(toEvents(junk), []);
+  }
+});
+
+test('via fake (stream-json): onEvent receives init/thinking/text/tool_use/tool_result in order; result still parsed', async () => {
+  const events = [];
+  const out = await createClaudeRunner(baseOpts).run({
+    prompt: 'do it', cwd: os.tmpdir(), onEvent: (t, d) => events.push([t, d]),
+  });
+  assert.equal(out.outcome, 'succeeded');
+  assert.equal(out.result, 'echo: do it');
+  assert.deepEqual(events.map((e) => e[0]), ['init', 'thinking', 'assistant_text', 'tool_use', 'tool_result', 'assistant_text']);
+  assert.equal(events[3][1].name, 'Bash');
+});
+
+test('a throwing onEvent never breaks the run', async () => {
+  const out = await createClaudeRunner(baseOpts).run({
+    prompt: 'x', cwd: os.tmpdir(), onEvent: () => { throw new Error('boom'); },
+  });
+  assert.equal(out.outcome, 'succeeded');
 });

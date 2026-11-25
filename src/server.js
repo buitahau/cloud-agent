@@ -1,10 +1,23 @@
 // src/server.js
-// Express app: POST /run-agent (202), GET /run-agent/:id (200/404), GET /health. x-api-key auth.
+// Express app: POST /run-agent (202), GET /run-agent/:id (200/404), GET /run-agent/:id/events (SSE), GET /health.
+// x-api-key auth.
 // Covers T2 (non-blocking submit), T4 (404), plus auth/validation.
 
 import express from 'express';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { validateRunAgentBody } from './lib/validate.js';
+import { TERMINAL_STATUSES } from './jobStore.js';
+
+/**
+ * One SSE frame. JSON.stringify never emits raw newlines, so a single `data:` line is always valid.
+ * `id:` is omitted for synthetic events (gap) so Last-Event-ID keeps pointing at the last real event.
+ * @param {{ seq?: number, type: string, data: object }} evt
+ * @returns {string}
+ */
+export function formatSse(evt) {
+  const id = evt.seq === undefined ? '' : `id: ${evt.seq}\n`;
+  return `${id}event: ${evt.type}\ndata: ${JSON.stringify(evt.data)}\n\n`;
+}
 
 /**
  * @typedef {Object} AppDeps
@@ -12,6 +25,9 @@ import { validateRunAgentBody } from './lib/validate.js';
  * @property {import('./jobStore.js').JobStore} store
  * @property {Pick<import('./worker.js').Worker, 'enqueue'>} worker
  * @property {{ info: Function, warn: Function, error: Function }} [logger=console]
+ * @property {number} [sseHeartbeatMs=15000]   interval of the ": ping" comment that keeps proxies from idling out
+ * @property {number} [sseMaxBufferedBytes=1048576]  a client whose socket buffer exceeds this is dropped (it can
+ *                                              reconnect with Last-Event-ID) so a slow reader never grows memory
  */
 
 /**
@@ -30,6 +46,14 @@ import { validateRunAgentBody } from './lib/validate.js';
  *  - GET  /run-agent/:id
  *        job = store.get(req.params.id); !job -> 404 { error: 'job not found' }
  *        -> 200 store.toPublic(job)
+ *  - GET  /run-agent/:id/events  (Server-Sent Events; same x-api-key auth — browsers' EventSource cannot send
+ *        headers, so use fetch() with a streaming reader, or @microsoft/fetch-event-source)
+ *        unknown id -> 404 JSON. Otherwise 200 text/event-stream: replays buffered events with seq >
+ *        Last-Event-ID (or ?since=), then streams live ones. Frames: `id: <seq>\nevent: <type>\ndata: <json>`.
+ *        If events were evicted from the ring, a `gap { dropped }` event precedes the replay.
+ *        The stream ends right after the terminal `result` event (or immediately after replay if the job is
+ *        already finished). `: ping` comments every sseHeartbeatMs.
+ *        app.closeStreams() ends every open stream (graceful shutdown).
  *  - 404 fallthrough               -> 404 { error: 'not found' }
  *  - error handler (4 args):
  *        err.type === 'entity.parse.failed'   -> 400 { error: 'invalid JSON body' }
@@ -44,6 +68,10 @@ import { validateRunAgentBody } from './lib/validate.js';
 export function createApp(deps) {
   const { config, store, worker } = deps;
   const logger = deps.logger ?? console;
+  const heartbeatMs = deps.sseHeartbeatMs ?? 15_000;
+  const maxBuffered = deps.sseMaxBufferedBytes ?? 1024 * 1024;
+  /** @type {Set<import('express').Response>} */
+  const openStreams = new Set();
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '1mb' }));
@@ -73,6 +101,69 @@ export function createApp(deps) {
     }
     res.status(200).json(store.toPublic(job));
   });
+
+  app.get('/run-agent/:id/events', (req, res) => {
+    const id = req.params.id;
+    const job = store.get(id);
+    if (!job) {
+      res.status(404).json({ error: 'job not found' });
+      return;
+    }
+    const rawLast = req.get('last-event-id') ?? (typeof req.query.since === 'string' ? req.query.since : '0');
+    const lastSeq = Number.parseInt(rawLast, 10);
+    const after = Number.isFinite(lastSeq) && lastSeq > 0 ? lastSeq : 0;
+
+    res.status(200).set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no', // tell nginx not to buffer the stream
+    });
+    res.flushHeaders();
+    res.write('retry: 3000\n\n');
+    openStreams.add(res);
+
+    let unsubscribe = null;
+    let heartbeat = null;
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      if (unsubscribe) unsubscribe();
+      if (heartbeat) clearInterval(heartbeat);
+      openStreams.delete(res);
+    };
+    const finish = () => { cleanup(); if (!res.writableEnded) res.end(); };
+    const send = (evt) => {
+      if (done) return;
+      res.write(formatSse(evt));
+      if (evt.type === 'result') { finish(); return; }
+      if (res.writableLength > maxBuffered) finish(); // slow reader: drop; it resumes via Last-Event-ID
+    };
+    res.on('close', cleanup);
+
+    // Subscribe BEFORE replay; both are synchronous so no event can slip between them.
+    unsubscribe = store.subscribe(id, send);
+    const replay = store.readEvents(id, after);
+    if (replay) {
+      if (replay.dropped > 0) res.write(formatSse({ type: 'gap', data: { dropped: replay.dropped } }));
+      for (const evt of replay.events) send(evt);
+    }
+    if (done) return;
+    if (TERMINAL_STATUSES.has(job.status)) { finish(); return; } // result event was evicted/never replayed
+    heartbeat = setInterval(() => { if (!done) res.write(': ping\n\n'); }, heartbeatMs);
+    heartbeat.unref?.();
+  });
+
+  /** End every open SSE stream (called on shutdown so server.close() isn't held open). */
+  app.closeStreams = () => {
+    const pending = [...openStreams].map((res) => new Promise((resolve) => {
+      res.once('close', resolve);
+      res.end();
+      setTimeout(resolve, 1000).unref?.();
+    }));
+    return Promise.all(pending).then(() => undefined);
+  };
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'not found' });

@@ -1,5 +1,7 @@
 // src/claudeRunner.js
 // Run `claude -p` headless inside the workspace, enforce the job timeout, parse the JSON result.
+// Output is `--output-format stream-json --verbose` (NDJSON): each line is mapped to a live event via onEvent
+// (see toEvents) and the final `type: "result"` line is the same object `--output-format json` used to print.
 // Covers T3/T5/T7/T8 (happy path), T9 (failure), T10 (timeout kill).
 
 import { runProcess } from './lib/processRunner.js';
@@ -49,7 +51,8 @@ export const STRIPPED_ENV_VARS = Object.freeze([
 
 /**
  * @typedef {Object} ClaudeRunner
- * @property {(p: { prompt: string, cwd: string, log?: (line: string) => void, signal?: AbortSignal }) => Promise<ClaudeOutcome>} run
+ * @property {(p: { prompt: string, cwd: string, log?: (line: string) => void,
+ *                  onEvent?: (type: string, data: object) => void, signal?: AbortSignal }) => Promise<ClaudeOutcome>} run
  *           Never rejects.
  */
 
@@ -59,9 +62,9 @@ export const STRIPPED_ENV_VARS = Object.freeze([
  * run({ prompt, cwd, log, signal }):
  *  1. log("[claude] $ <claudeBin> <args joined by space>")  (prompt is NOT in args; see buildClaudeArgs)
  *  2. r = await run({ cmd: claudeBin, args: buildClaudeArgs(...), cwd, env: buildClaudeEnv(...),
- *                     stdin: prompt, timeoutMs, killGraceMs, signal, lineStdout: false,
- *                     onLine: (l, s) => s === 'stderr' && log(`[claude:stderr] ${l}`) })
- *  3. parsed = parseClaudeJson(r.stdout)
+ *                     stdin: prompt, timeoutMs, killGraceMs, signal, lineStdout: true,
+ *                     onLine: stderr -> log(`[claude:stderr] ${l}`); stdout -> JSON.parse, onEvent(...toEvents) })
+ *  3. parsed = the `result` line seen while streaming (immune to the capture cap) ?? parseClaudeJson(r.stdout)
  *  4. if !parsed && r.stdout.trim(): log last 20 lines of r.stdout prefixed "[claude:stdout] "
  *  5. log summary: "[claude] exit=<code|signal> subtype=<..> turns=<..> cost_usd=<..> duration_ms=<..>"
  *  6. return classifyClaudeRun(r, parsed, timeoutMs)
@@ -82,8 +85,22 @@ export function createClaudeRunner(opts) {
   const args = buildClaudeArgs({ permissionMode, maxTurns });
 
   return {
-    async run({ prompt, cwd, log = () => {}, signal }) {
+    async run({ prompt, cwd, log = () => {}, onEvent = () => {}, signal }) {
       const safeLog = (line) => { try { log(line); } catch { /* never throw from logging */ } };
+      /** @type {ClaudeJsonResult|null} */
+      let streamResult = null;
+      const onStdoutLine = (line) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) return;
+        let obj;
+        try { obj = JSON.parse(trimmed); } catch { return; }
+        if (isResult(obj)) streamResult = obj;
+        let events = [];
+        try { events = toEvents(obj); } catch { /* unknown shape: ignore */ }
+        for (const [type, data] of events) {
+          try { onEvent(type, data); } catch { /* never throw from event delivery */ }
+        }
+      };
       try {
         safeLog(`[claude] $ ${claudeBin} ${args.join(' ')}`);
         const r = await run({
@@ -95,10 +112,10 @@ export function createClaudeRunner(opts) {
           timeoutMs,
           killGraceMs,
           signal,
-          lineStdout: false,
-          onLine: (l, s) => { if (s === 'stderr') safeLog(`[claude:stderr] ${l}`); },
+          lineStdout: true,
+          onLine: (l, s) => { if (s === 'stderr') safeLog(`[claude:stderr] ${l}`); else onStdoutLine(l); },
         });
-        const parsed = parseClaudeJson(r.stdout);
+        const parsed = streamResult ?? parseClaudeJson(r.stdout);
         if (!parsed && r.stdout.trim()) {
           const lines = r.stdout.split(/\r?\n/).filter((l) => l.length > 0).slice(-20);
           for (const l of lines) safeLog(`[claude:stdout] ${l}`);
@@ -121,14 +138,18 @@ export function createClaudeRunner(opts) {
  * Argument vector. The prompt is delivered on STDIN (not argv): avoids argv size limits and prompts that
  * start with "-" being parsed as flags. `claude -p` reads the prompt from stdin when no positional is given.
  *
- * Exactly: ['-p', '--output-format', 'json', '--permission-mode', permissionMode, '--max-turns', String(maxTurns)]
+ * Exactly: ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', permissionMode, '--max-turns', String(maxTurns)]
+ * (stream-json requires --verbose in print mode.)
  * (--max-turns is accepted by claude 2.x even though it's hidden from --help.)
  *
  * @param {{ permissionMode: string, maxTurns: number }} p
  * @returns {string[]}
  */
 export function buildClaudeArgs(p) {
-  return ['-p', '--output-format', 'json', '--permission-mode', p.permissionMode, '--max-turns', String(p.maxTurns)];
+  return [
+    '-p', '--output-format', 'stream-json', '--verbose',
+    '--permission-mode', p.permissionMode, '--max-turns', String(p.maxTurns),
+  ];
 }
 
 /**
@@ -234,4 +255,70 @@ export function toMeta(parsed) {
     subtype: pick('subtype'),
     is_error: pick('is_error'),
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// stream-json -> live events
+// ---------------------------------------------------------------------------------------------------------
+
+/** Max chars of any text field sent in a live event (tool output can be huge and may contain secrets). */
+export const MAX_EVENT_TEXT = 4000;
+/** Max serialized size of a tool_use input kept as an object; larger inputs become { _truncated, preview }. */
+export const MAX_EVENT_INPUT = 4000;
+
+const clip = (v, max = MAX_EVENT_TEXT) => {
+  const s = typeof v === 'string' ? v : JSON.stringify(v ?? '');
+  return s.length > max ? { text: s.slice(0, max), truncated: true, length: s.length } : { text: s, truncated: false, length: s.length };
+};
+
+/**
+ * Map ONE parsed stream-json line to zero or more live events `[type, data]`.
+ * The format is not formally versioned, so this is deliberately defensive: unknown line types / content
+ * blocks yield no events and never throw.
+ *
+ *  system/init            -> init { session_id, model, tools }
+ *  assistant text block   -> assistant_text { text, truncated }
+ *  assistant thinking     -> thinking { text, truncated, redacted }   (only present when extended thinking is on;
+ *                                                                      may be summarized / redacted by the API)
+ *  assistant tool_use     -> tool_use { id, name, input }              (input truncated, see MAX_EVENT_INPUT)
+ *  user tool_result       -> tool_result { tool_use_id, is_error, text, truncated }
+ *  result                 -> (none; the job store emits the terminal `result` event on the status transition)
+ *
+ * @param {any} obj
+ * @returns {Array<[string, object]>}
+ */
+export function toEvents(obj) {
+  if (obj === null || typeof obj !== 'object') return [];
+  if (obj.type === 'system' && obj.subtype === 'init') {
+    return [['init', { session_id: obj.session_id ?? null, model: obj.model ?? null, tools: Array.isArray(obj.tools) ? obj.tools : [] }]];
+  }
+  const content = obj.message?.content;
+  if ((obj.type !== 'assistant' && obj.type !== 'user') || !Array.isArray(content)) return [];
+  /** @type {Array<[string, object]>} */
+  const out = [];
+  for (const b of content) {
+    if (b === null || typeof b !== 'object') continue;
+    if (obj.type === 'assistant') {
+      if (b.type === 'text' && typeof b.text === 'string') {
+        const c = clip(b.text);
+        out.push(['assistant_text', { text: c.text, truncated: c.truncated }]);
+      } else if (b.type === 'thinking') {
+        const c = clip(typeof b.thinking === 'string' ? b.thinking : '');
+        out.push(['thinking', { text: c.text, truncated: c.truncated, redacted: c.text === '' }]);
+      } else if (b.type === 'redacted_thinking') {
+        out.push(['thinking', { text: '', truncated: false, redacted: true }]);
+      } else if (b.type === 'tool_use') {
+        const raw = JSON.stringify(b.input ?? {});
+        const input = raw.length <= MAX_EVENT_INPUT ? (b.input ?? {}) : { _truncated: true, preview: raw.slice(0, MAX_EVENT_INPUT) };
+        out.push(['tool_use', { id: b.id ?? null, name: b.name ?? null, input }]);
+      }
+    } else if (b.type === 'tool_result') {
+      const body = Array.isArray(b.content)
+        ? b.content.map((x) => (typeof x?.text === 'string' ? x.text : '')).join('')
+        : (b.content ?? '');
+      const c = clip(body);
+      out.push(['tool_result', { tool_use_id: b.tool_use_id ?? null, is_error: b.is_error === true, text: c.text, truncated: c.truncated }]);
+    }
+  }
+  return out;
 }

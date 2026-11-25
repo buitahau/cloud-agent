@@ -109,6 +109,7 @@ export async function main() {
     server.close();
     try {
       await worker.shutdown(`Service shutting down (${sig})`);
+      await app.closeStreams(); // terminal events were just emitted; flush them and end SSE connections
     } catch (err) {
       console.error('Error during shutdown:', err);
     }

@@ -1,5 +1,27 @@
+# Dependencies
 node_modules/
+
+# Secrets / local config (keep .env.example tracked)
 .env
+.env.*
+!.env.example
+
+# Runtime data
 workspace/
 data/
 *.log
+npm-debug.log*
+
+# Test / coverage output
+coverage/
+.nyc_output/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json

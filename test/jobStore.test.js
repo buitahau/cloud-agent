@@ -116,3 +116,37 @@ test('logs_tail returns the last logsTailLines lines', () => {
   assert.equal(store.toPublic(j).logs_tail, 'line 18\nline 19\nline 20');
   assert.equal(j.log.size, 10);
 });
+
+test('events: monotonic seq, status + terminal result events, replay via readEvents, bounded ring with dropped count', () => {
+  const store = createJobStore({ eventCapacity: 4 });
+  const job = store.create({ prompt: 'p', branch: 'b' });
+  const seen = [];
+  const unsub = store.subscribe(job.id, (e) => seen.push(e.type));
+  store.transition(job.id, 'pulling');
+  store.appendLog(job.id, 'hello');
+  store.appendEvent(job.id, 'assistant_text', { text: 'hi' });
+  assert.deepEqual(seen, ['status', 'log', 'assistant_text']);
+  unsub();
+  store.transition(job.id, 'running');
+  assert.equal(seen.length, 3); // unsubscribed
+
+  // capacity 4: 4 events so far (status, log, assistant_text, status) -> add terminal (status+result) evicts 2
+  store.transition(job.id, 'succeeded', { result: 'done' });
+  const all = store.readEvents(job.id, 0);
+  assert.deepEqual(all.events.map((e) => e.seq), [3, 4, 5, 6]);
+  assert.equal(all.dropped, 2);
+  assert.equal(all.events.at(-1).type, 'result');
+  assert.equal(all.events.at(-1).data.result, 'done');
+  const later = store.readEvents(job.id, 4);
+  assert.deepEqual(later.events.map((e) => e.seq), [5, 6]);
+  assert.equal(later.dropped, 0);
+  assert.equal(store.readEvents('nope'), null);
+  assert.equal(store.subscribe('nope', () => {}), null);
+  assert.equal(store.appendEvent('nope', 'x'), null);
+  // a throwing subscriber never breaks the store
+  const j2 = store.create({ prompt: 'p', branch: 'b' });
+  store.subscribe(j2.id, () => { throw new Error('bad subscriber'); });
+  assert.doesNotThrow(() => store.appendEvent(j2.id, 'log', {}));
+  // events are internal: not in the public shape
+  assert.ok(!('events' in store.toPublic(job)));
+});

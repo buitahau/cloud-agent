@@ -293,3 +293,25 @@ test('shutdown while pulling -> job failed "Service shutting down"', async () =>
   assert.equal(j.status, 'failed');
   assert.equal(j.error, 'Service shutting down');
 });
+
+test('SSE events: a real job through worker + fake claude emits status, claude events and a terminal result', async () => {
+  const fx = createGitFixture();
+  try {
+    const deps = realDeps(fx);
+    const worker = createWorker(deps);
+    const job = deps.store.create({ prompt: '[[fake:success]] go', branch: fx.branch ?? 'main' });
+    worker.enqueue(job.id);
+    await tick();
+    await worker.onIdle();
+    const { events } = deps.store.readEvents(job.id, 0);
+    const types = events.map((e) => e.type);
+    for (const t of ['status', 'log', 'init', 'thinking', 'assistant_text', 'tool_use', 'tool_result', 'result']) {
+      assert.ok(types.includes(t), `missing ${t} in ${types.join(',')}`);
+    }
+    assert.equal(types.at(-1), 'result');
+    assert.equal(events.at(-1).data.status, 'succeeded');
+    assert.equal(job.status, 'succeeded');
+  } finally {
+    fx.cleanup?.();
+  }
+});

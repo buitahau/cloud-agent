@@ -22,6 +22,10 @@
 //   junk             creates junk.txt, junkdir/a.txt, node_modules/keep.txt in cwd and modifies a tracked
 //                    file README.md (appends a line) if present, then success. Used for T12.
 //   pwd              result = process.cwd()
+//   stream           (with --output-format stream-json) prints the event lines ONE BY ONE with ~150ms gaps,
+//                    so tests can observe live SSE delivery; then the result line.
+// With `--output-format stream-json` every mode prints NDJSON: system/init, assistant (thinking + text + tool_use),
+// user (tool_result), then the result line. With `--output-format json` (auth probe) only the result object.
 // FAKE_CLAUDE_AUTH=invalid makes every -p call return the real 401 shape (is_error:true, exit 1) — T1.
 // If $FAKE_CLAUDE_RECORD is set, appends one JSON line per invocation:
 //   { argv, cwd, stdin, env: { CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, CLAUDECODE } }   (values or null)
@@ -59,7 +63,26 @@ function record(stdin) {
   }) + '\n');
 }
 
+const STREAM = argv.includes('stream-json');
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const line = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+
+/** The intermediate stream-json lines (everything except the final result). */
+function streamLines(prompt) {
+  return [
+    { type: 'system', subtype: 'init', session_id: '00000000-0000-4000-8000-000000000000', model: 'fake-model', tools: ['Bash', 'Read'] },
+    { type: 'assistant', message: { content: [
+      { type: 'thinking', thinking: 'I should look at the repo first.' },
+      { type: 'text', text: `Working on: ${String(prompt).slice(0, 80)}` },
+      { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } },
+    ] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'README.md\n' }] } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Done looking.' }] } },
+  ];
+}
+
 function emit(obj, code) {
+  if (STREAM && !emit.skipPrelude) for (const l of streamLines(emit.prompt)) line(l);
   const full = {
     type: 'result',
     subtype: 'success',
@@ -70,7 +93,7 @@ function emit(obj, code) {
     total_cost_usd: 0,
     ...obj,
   };
-  process.stdout.write(JSON.stringify(full));
+  process.stdout.write(STREAM ? JSON.stringify(full) + '\n' : JSON.stringify(full));
   process.exitCode = code;
 }
 
@@ -82,6 +105,7 @@ async function runPrint() {
     if (last && !last.startsWith('-')) prompt = last;
   }
   record(prompt);
+  emit.prompt = prompt;
 
   if (process.env.FAKE_CLAUDE_AUTH === 'invalid') {
     return emit({
@@ -99,6 +123,11 @@ async function runPrint() {
   switch (mode) {
     case 'success':
       return emit({ result: `echo: ${prompt}` }, 0);
+    case 'stream': {
+      for (const l of streamLines(prompt)) { line(l); await sleepMs(150); }
+      emit.skipPrelude = true;
+      return emit({ result: `streamed: ${prompt}` }, 0);
+    }
     case 'pwd':
       return emit({ result: process.cwd() }, 0);
     case 'cat': {
