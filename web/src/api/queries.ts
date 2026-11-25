@@ -52,3 +52,16 @@ export function useJobsInfinite(repo: string, statuses: string[]) {
   });
   return q;
 }
+
+/** Small, polled slice of the newest jobs (optionally by status) for overview widgets. Same endpoint as the table. */
+export const useRecentJobs = (statuses: string[], limit = 6, repo = '') =>
+  useQuery({
+    queryKey: ['jobs', 'recent', repo, statuses.join(','), limit],
+    queryFn: () => {
+      const p = new URLSearchParams({ limit: String(limit) });
+      if (statuses.length) p.set('status', statuses.join(','));
+      if (repo) p.set('repo', repo);
+      return getJson<JobPage>(`/jobs?${p}`);
+    },
+    refetchInterval: POLL_MS,
+  });

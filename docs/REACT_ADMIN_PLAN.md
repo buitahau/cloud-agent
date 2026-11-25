@@ -15,6 +15,7 @@ Like-for-like, **read-only** port — no new actions. API shapes are unchanged.
 | Build output | `web/dist/`, gitignored; `npm run build` before `npm start` | No generated files in diffs; Express returns 503 "not built" if missing |
 | Polling | TanStack Query `refetchInterval: 5000`; jobs list polls only while one page is loaded | Avoid refetching every loaded page |
 | SSE | Custom `useJobEvents` hook over `EventSource` (Basic auth resent by browser) | No library needed |
+| Icons | `@ant-design/icons` (official antd set, tree-shaken inline SVG, ~10 kB) | Status/nav/event iconography; no external assets (CSP-safe) |
 | Safety | React escaping only; never `dangerouslySetInnerHTML` (enforced by test) | Job text is untrusted |
 
 ## Steps
@@ -51,6 +52,16 @@ Status: **all five steps done** (verified with `npm test` and headless-Chromium 
 - `JobPage`: meta, status timeline, error, prompt/result, `EventStream` (type tags, tool use/result, gap, sticky auto-scroll), log.
 - Delete `src/admin/public/`; update README, ARCHITECTURE.md, MULTI_REPO_PLAN.md, admin.js header.
 - **Done when:** live job, finished job (no reconnect loop) and HTML-in-prompt (rendered as text) all behave correctly.
+
+### Step 6 — UX redesign (ops-console polish)
+- Shell: left sider nav (Overview, Jobs with running badge, repositories with live health dots), sticky top bar with "open job by id" and data-freshness indicator; drawer nav below `lg`. Theme tokens in `main.tsx`; `AppLayout` exposes tokens as `--c-*` CSS variables used by `index.css`, so custom styles follow light/dark.
+- Shared UI in `components/ui.tsx`: `PageHeader`, `StatTile`, `StatusDistribution` (stacked bar), `TimeAgo` (one shared 1 s clock), `CopyButton` (http fallback), `Panel`. `StatusTag`/`HealthTag` are icon pills using antd `*Text` tokens for contrast.
+- Overview: KPI tiles (slots used, queued, 24 h success rate, problems) linking to filtered job lists, 24 h distribution, "Active now" and "Recent failures" lists (`useRecentJobs`, same `/jobs` endpoint), repo cards with health accent and status bar.
+- Jobs table: status · prompt-first job cell (short id, repo, branch@commit, error line) · created · total duration (breakdown tooltip, live elapsed) · cost · turns; whole row clickable; responsive columns; clear-filters + filtered empty state.
+- Repo page: header with health/URL, sync-error alert, stat tiles, distribution, jobs table.
+- Job page: header (short id + copy, status, Live), prominent error, facts strip (elapsed, waited, Claude time, turns, cost, model), proportional phase timeline, prompt/result with copy, tabs Activity / Log / Details.
+- `EventStream` (`lib/events.ts`): tool_use + tool_result merged by `tool_use_id` into one collapsible row (summary, ok/error/running state, input/output with copy; errors auto-expand), consecutive log lines grouped, status/init as dividers, filter chips with counts, text search, follow-tail with "N new · jump to latest".
+- `useJobEvents` refetches the job on live `status` events so the header/timeline don't go stale until `result`.
 
 ## Out of scope (follow-ups)
 - Job submission / cancel (needs CSRF guard and worker abort path).

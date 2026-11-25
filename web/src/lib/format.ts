@@ -1,35 +1,60 @@
 import type { EventDataMap, EventType } from '../api/types';
 
-export function ago(iso: string | null | undefined): string {
+/** Relative time: "12s ago", "5m ago", "3h ago", "4d ago", then a short date. */
+export function ago(iso: string | null | undefined, now = Date.now()): string {
   if (!iso) return '—';
-  const s = Math.round((Date.now() - Date.parse(iso)) / 1000);
-  if (s < 60) return `${Math.max(s, 0)}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
-  return new Date(iso).toLocaleString();
+  const s = Math.round((now - Date.parse(iso)) / 1000);
+  if (s < 5) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  if (s < 86400 * 14) return `${Math.floor(s / 86400)}d ago`;
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
+
+/** Absolute timestamp for tooltips: "Nov 25, 2026, 15:42:51". */
+export function stamp(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+}
+
+/** Wall-clock time only: "15:42:51". */
+export const clock = (iso: string | number) =>
+  new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
 export function dur(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined) return '—';
-  if (ms < 1000) return `${ms}ms`;
+  if (ms === null || ms === undefined || Number.isNaN(ms)) return '—';
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
   const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
   const m = Math.floor(s / 60);
-  return `${m}m ${Math.round(s % 60)}s`;
+  if (m < 60) return `${m}m ${Math.floor(s % 60)}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-export const money = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`);
+export const money = (v: number | null | undefined) => {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  return n !== 0 && Math.abs(n) < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
+};
 
 export const upt = (s: number) =>
-  s < 3600 ? `${Math.round(s / 60)}m` : `${Math.floor(s / 3600)}h ${Math.round((s % 3600) / 60)}m`;
+  s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400
+    ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+    : `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 
-export const shortId = (id: string) => `${id.slice(0, 12)}…`;
+/** Job ids look like "job_<32 hex>": show the first 8 hex chars (git-style). Full id stays in tooltips/copy. */
+export const shortId = (id: string) => id.replace(/^job_/, '').slice(0, 8);
 
 export const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
-export const label = (s: string) => s.replace('_', ' ');
+export const label = (s: string) => s.replaceAll('_', ' ');
 
-/** One-line text for an SSE event (port of the old dashboard's describe()). */
+export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** One-line text for an SSE event. */
 export function describe<K extends EventType>(type: K, data: EventDataMap[K]): string {
   const d = data as Record<string, any>;
   switch (type) {
@@ -44,4 +69,28 @@ export function describe<K extends EventType>(type: K, data: EventDataMap[K]): s
     case 'result': return `${d.status}${d.error ? `: ${d.error}` : ''}`;
     default: return truncate(JSON.stringify(d), 600);
   }
+}
+
+/** Short, human summary of a tool call's input: the most telling field (path, command, pattern, url…). */
+export function toolSummary(input: unknown): string {
+  if (input === null || input === undefined) return '';
+  if (typeof input !== 'object') return truncate(String(input), 200);
+  const o = input as Record<string, unknown>;
+  for (const k of ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'description', 'prompt', 'notebook_path']) {
+    if (typeof o[k] === 'string' && o[k]) return truncate((o[k] as string).split('\n')[0], 200);
+  }
+  const firstStr = Object.values(o).find((v) => typeof v === 'string' && v);
+  if (typeof firstStr === 'string') return truncate(firstStr.split('\n')[0], 200);
+  return truncate(JSON.stringify(o), 200);
+}
+
+/** Pretty JSON for display; compact on one line when short. */
+export function prettyJson(v: unknown): string {
+  let compact: string;
+  try {
+    compact = JSON.stringify(v ?? {});
+  } catch {
+    return String(v);
+  }
+  return compact.length <= 100 ? compact : JSON.stringify(v, null, 2);
 }

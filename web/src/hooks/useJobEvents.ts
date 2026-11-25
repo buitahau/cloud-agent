@@ -10,6 +10,7 @@ const MAX_EVENTS = 2000; // matches the server's per-job event buffer
  * Live job events over SSE. The server replays buffered events first, then streams until `result`.
  * - Dedupes by seq across the browser's automatic reconnects (it resends Last-Event-ID itself).
  * - Batches state updates once per animation frame so a burst of log lines is one render.
+ * - Refetches the job on `status` events while live, so the page's status/timeline follow along.
  * - Closes on `result` (and refreshes the job + lists), and on error once the job is terminal — the server
  *   ends a finished job's stream after replay, which would otherwise make EventSource reconnect forever.
  *
@@ -65,6 +66,10 @@ export function useJobEvents(jobId: string, enabled: boolean, terminal: boolean)
         pending.push({ key, seq, type, data } as JobEvent);
         if (!frame) frame = requestAnimationFrame(flush);
 
+        // Status changes on a live job: refetch the job so the header, timeline and facts don't go stale.
+        if (type === 'status' && !terminalRef.current) {
+          void qc.invalidateQueries({ queryKey: keys.job(jobId) });
+        }
         if (type === 'result') {
           close();
           void qc.invalidateQueries({ queryKey: keys.job(jobId) });

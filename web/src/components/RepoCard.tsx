@@ -1,65 +1,76 @@
-import { Card, Descriptions, Space, Tag, Typography } from 'antd';
+import { BranchesOutlined, LoadingOutlined } from '@ant-design/icons';
+import { theme, Tooltip } from 'antd';
 import { Link } from 'react-router';
-import { JOB_STATUSES, type RepoStatus } from '../api/types';
-import { ago, dur, shortId } from '../lib/format';
-import { HealthTag, StatusTag } from './StatusTag';
+import type { RepoStatus } from '../api/types';
+import { dur, shortId } from '../lib/format';
+import { HealthTag, healthTone, StatusTag } from './StatusTag';
+import { CopyButton, StatusDistribution, TimeAgo } from './ui';
 
 export function RepoCard({ repo: r }: { repo: RepoStatus }) {
+  const { token } = theme.useToken();
   const ls = r.last_sync;
-  const counts = JOB_STATUSES.filter((s) => r.counts[s]);
+  const enc = encodeURIComponent;
   return (
-    <Card
-      size="small"
-      title={<Link to={`/repos/${encodeURIComponent(r.id)}`}>{r.id}</Link>}
-      extra={
-        <Space size={4}>
-          <Typography.Text type="secondary">{r.default_branch}</Typography.Text>
-          <HealthTag health={r.health} />
-        </Space>
-      }
-      style={{ height: '100%' }}
-    >
-      <Typography.Text code copyable style={{ wordBreak: 'break-all' }}>
-        {r.url_display}
-      </Typography.Text>
-      <Descriptions size="small" column={1} style={{ marginTop: 12 }}>
-        <Descriptions.Item label="Last sync">
-          {ls ? `${ago(ls.at)} · ${ls.branch}${ls.commit ? ` @ ${ls.commit}` : ''} · ${dur(ls.duration_ms)}` : 'never'}
-        </Descriptions.Item>
-        {ls && !ls.ok && (
-          <Descriptions.Item label="Sync error">
-            <Typography.Text type="danger">{ls.error ?? 'unknown'}</Typography.Text>
-          </Descriptions.Item>
-        )}
-        <Descriptions.Item label="Workspace">{r.cloned ? 'cloned' : 'not cloned yet'}</Descriptions.Item>
-        <Descriptions.Item label="Now">
-          {r.running_job_id ? (
-            <Link to={`/jobs/${encodeURIComponent(r.running_job_id)}`}>running {shortId(r.running_job_id)}</Link>
-          ) : (
-            'idle'
-          )}
-          {r.queued ? ` · ${r.queued} queued` : ''}
-        </Descriptions.Item>
-        <Descriptions.Item label="Last job">
-          {r.last_job ? (
-            <Space size={6} wrap>
-              <Link className="mono" to={`/jobs/${encodeURIComponent(r.last_job.id)}`}>{shortId(r.last_job.id)}</Link>
-              <StatusTag status={r.last_job.status} />
-              <Typography.Text type="secondary">{ago(r.last_job.created_at)}</Typography.Text>
-            </Space>
-          ) : (
-            '—'
-          )}
-        </Descriptions.Item>
-      </Descriptions>
-      {counts.length > 0 && (
-        <Space size={4} wrap style={{ marginTop: 8 }}>
-          {counts.map((s) => (
-            <StatusTag key={s} status={s}>{`${r.counts[s]} ${s}`}</StatusTag>
-          ))}
-        </Space>
+    <div className="panel repo-card" style={{ '--accent': healthTone(token, r.health).solid } as React.CSSProperties}>
+      <div className="repo-card-head">
+        <Link className="repo-card-name" to={`/repos/${enc(r.id)}`}>{r.id}</Link>
+        <HealthTag health={r.health} />
+        <span style={{ marginLeft: 'auto' }} className="muted nowrap">
+          <BranchesOutlined /> {r.default_branch}
+        </span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: -6 }}>
+        <span className="mono muted ellipsis" style={{ fontSize: 12 }} title={r.url_display}>{r.url_display}</span>
+        <CopyButton text={r.url_display} label="Copy repo URL" />
+      </div>
+
+      {ls && !ls.ok && (
+        <div className="codebox err" style={{ maxHeight: 80 }}>
+          <strong>Last sync failed:</strong> {ls.error ?? 'unknown error'}
+        </div>
       )}
-      {counts.length === 0 && <Tag>no jobs</Tag>}
-    </Card>
+
+      <dl className="kv">
+        <dt>Now</dt>
+        <dd>
+          {r.running_job_id ? (
+            <Link to={`/jobs/${enc(r.running_job_id)}`}>
+              <LoadingOutlined style={{ marginRight: 6 }} />
+              running <span className="mono">{shortId(r.running_job_id)}</span>
+            </Link>
+          ) : (
+            <span className="muted">idle</span>
+          )}
+          {r.queued > 0 && <span className="muted"> · {r.queued} queued</span>}
+        </dd>
+        <dt>Last job</dt>
+        <dd>
+          {r.last_job ? (
+            <Link to={`/jobs/${enc(r.last_job.id)}`} style={{ display: 'inline-flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <StatusTag status={r.last_job.status} hint={false} />
+              <span className="muted"><TimeAgo at={r.last_job.created_at} /></span>
+            </Link>
+          ) : (
+            <span className="muted">none yet</span>
+          )}
+        </dd>
+        <dt>Last sync</dt>
+        <dd>
+          {ls ? (
+            <Tooltip title={`${ls.branch}${ls.commit ? ` @ ${ls.commit}` : ''} · took ${dur(ls.duration_ms)}`}>
+              <span>
+                <TimeAgo at={ls.at} /> <span className="muted">· {ls.branch}{ls.commit && <> @ <span className="mono">{ls.commit.slice(0, 8)}</span></>}</span>
+              </span>
+            </Tooltip>
+          ) : (
+            <span className="muted">never{r.cloned ? '' : ' · workspace not cloned yet'}</span>
+          )}
+        </dd>
+      </dl>
+
+      <div style={{ marginTop: 'auto' }}>
+        <StatusDistribution counts={r.counts} />
+      </div>
+    </div>
   );
 }
