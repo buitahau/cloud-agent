@@ -84,6 +84,32 @@ Ctrl-C / SIGTERM shuts down gracefully: queued jobs are marked failed, running c
   was running"). Unset = in memory only. The live event timeline is not saved; status, result and log are.
 - `JOB_RETENTION_MAX` (default `1000`) finished jobs are kept; older ones are dropped. Queued/running jobs never are.
 
+## Deploy (Docker + VPS)
+
+The image (`Dockerfile`) builds the dashboard, installs the Claude Code CLI globally and runs as the non-root `node`
+user. Claude's subscription login is **not** baked into the image: it lives in the `claude-home` volume
+(`/home/node`), so it survives redeploys. `.github/workflows/ci-cd.yml` tests every push/PR; on `main` it pushes
+`ghcr.io/<owner>/cloud-agent:<sha>` and deploys it to the VPS over SSH (`docker compose pull && up -d`).
+
+One-time VPS setup (Docker + compose plugin installed):
+
+```bash
+sudo mkdir -p /opt/cloud-agent && sudo chown $USER /opt/cloud-agent && cd /opt/cloud-agent
+# copy docker-compose.yml, .env and repos.json here (repos.json: "workspaceRoot": "./workspaces" is fine)
+echo <PAT with read:packages> | docker login ghcr.io -u <github-user> --password-stdin   # if the image is private
+docker compose pull
+docker compose run --rm cloud-agent claude      # then /login (open the URL, paste the code), then /exit
+docker compose up -d && docker compose logs -f  # expect "Claude auth OK" and "Listening on :8080"
+```
+
+GitHub repo settings: secrets `VPS_HOST`, `VPS_USER` (a user in the `docker` group), `VPS_SSH_KEY` (private key
+whose public half is in that user's `authorized_keys`), optional `VPS_PORT`; optional variable `DEPLOY_DIR`
+(default `/opt/cloud-agent`); an environment named `production` (add required reviewers there to gate deploys).
+
+Notes: the port is bound to `127.0.0.1` — put Caddy/nginx with TLS in front. A deploy restarts the service, so
+running jobs are marked failed. Claude jobs run *inside the container*, so add any toolchain the target repos need
+(browsers for e2e, python, ...) to the Dockerfile.
+
 ## Admin dashboard
 
 Set `ADMIN_PASSWORD` (≥ 8 chars, different from `API_KEY`) and open `http://localhost:8080/admin/`; the browser asks

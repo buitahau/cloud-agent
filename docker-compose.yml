@@ -1,0 +1,30 @@
+# Production stack for the VPS. Lives in the deploy dir (e.g. /opt/cloud-agent) next to .env and repos.json.
+# CI deploys with:  IMAGE=ghcr.io/<owner>/cloud-agent:<sha> docker compose up -d
+services:
+  cloud-agent:
+    image: ${IMAGE:-ghcr.io/buitahau/cloud-agent:latest}
+    build: .                      # lets you `docker compose build` locally too
+    restart: unless-stopped
+    env_file: .env
+    environment:                  # container paths win over whatever .env says
+      PORT: "8080"
+      REPOS_FILE: /app/repos.json
+      JOBS_FILE: /app/data/jobs.jsonl
+    ports:
+      - "127.0.0.1:8080:8080"     # localhost only: put a TLS reverse proxy (Caddy/nginx) in front
+    volumes:
+      # $HOME of the `node` user: holds the Claude subscription login (~/.claude/.credentials.json,
+      # ~/.claude.json). Log in once with: docker compose run --rm cloud-agent claude   (then /login)
+      - claude-home:/home/node
+      - ./repos.json:/app/repos.json:ro
+      - workspaces:/app/workspaces
+      - data:/app/data
+      # For ssh repos: put keys in ./ssh (owned by uid 1000, mode 600) and use
+      # "sshKeyPath": "/run/ssh-keys/<key>" in repos.json.
+      # - ./ssh:/run/ssh-keys:ro
+    stop_grace_period: 30s        # time for graceful shutdown (running claude jobs are killed and marked failed)
+
+volumes:
+  claude-home:
+  workspaces:
+  data:
