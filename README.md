@@ -11,8 +11,8 @@ Repos in SQLite + encrypted per-repo tokens (proposed): [docs/SQLITE_REPOS_PLAN.
 
 ## Setup
 
-Requirements: Node ≥ 18.20, git ≥ 2.31, Claude Code CLI (`claude`) on `PATH`. Run as a **non-root** user
-(claude refuses `bypassPermissions` as root).
+Requirements: Node ≥ 22.13 (for the built-in `node:sqlite`), git ≥ 2.31, Claude Code CLI (`claude`) on `PATH`.
+Run as a **non-root** user (claude refuses `bypassPermissions` as root).
 
 ```bash
 npm install
@@ -238,8 +238,8 @@ Notes:
 Set `ADMIN_PASSWORD` (≥ 8 chars, different from `API_KEY`) and open `http://localhost:8080/admin/`; the browser asks
 for `ADMIN_USER` (default `admin`) / `ADMIN_PASSWORD`. Without `ADMIN_PASSWORD`, `/admin` does not exist (404).
 
-The dashboard is a React + Ant Design app in `web/` (needs Node ≥ 22.22 to build; the server itself still runs on
-Node ≥ 18.20). Build it once before starting the server — until then `/admin/` answers `503 dashboard not built`:
+The dashboard is a React + Ant Design app in `web/` (needs Node ≥ 22.22 to build; the server itself needs
+Node ≥ 22.13). Build it once before starting the server — until then `/admin/` answers `503 dashboard not built`:
 
 ```bash
 npm run build:web      # installs web/ deps and writes web/dist (gitignored), served by Express at /admin/
