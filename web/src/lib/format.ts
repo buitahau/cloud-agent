@@ -94,3 +94,15 @@ export function prettyJson(v: unknown): string {
   }
   return compact.length <= 100 ? compact : JSON.stringify(v, null, 2);
 }
+
+const scalar = (v: unknown) => (v === null || v === undefined ? '—' : typeof v === 'string' ? v : JSON.stringify(v));
+/** Audit details as text lines: "url: a → b", "token: set …a1b2", "workspace: wiped". */
+export function auditLines(details: Record<string, unknown>): string[] {
+  return Object.entries(details ?? {}).map(([k, v]) => {
+    if (v && typeof v === 'object' && !Array.isArray(v) && 'from' in v && 'to' in v) {
+      const o = v as { from: unknown; to: unknown };
+      return `${k}: ${scalar(o.from)} → ${scalar(o.to)}`;
+    }
+    return `${k}: ${scalar(v)}`;
+  });
+}

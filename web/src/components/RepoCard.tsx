@@ -3,7 +3,8 @@ import { theme, Tooltip } from 'antd';
 import { Link } from 'react-router';
 import type { RepoStatus } from '../api/types';
 import { dur, shortId } from '../lib/format';
-import { HealthTag, healthTone, StatusTag } from './StatusTag';
+import { AuthInfo } from './RepoAuth';
+import { DisabledTag, HealthTag, healthTone, StatusTag } from './StatusTag';
 import { CopyButton, StatusDistribution, TimeAgo } from './ui';
 
 export function RepoCard({ repo: r }: { repo: RepoStatus }) {
@@ -11,10 +12,14 @@ export function RepoCard({ repo: r }: { repo: RepoStatus }) {
   const ls = r.last_sync;
   const enc = encodeURIComponent;
   return (
-    <div className="panel repo-card" style={{ '--accent': healthTone(token, r.health).solid } as React.CSSProperties}>
+    <div
+      className={`panel repo-card${r.enabled ? '' : ' is-disabled'}`}
+      style={{ '--accent': r.enabled ? healthTone(token, r.health).solid : token.colorTextQuaternary } as React.CSSProperties}
+    >
       <div className="repo-card-head">
         <Link className="repo-card-name" to={`/repos/${enc(r.id)}`}>{r.id}</Link>
         <HealthTag health={r.health} />
+        {!r.enabled && <DisabledTag />}
         <span style={{ marginLeft: 'auto' }} className="muted nowrap">
           <BranchesOutlined /> {r.default_branch}
         </span>
@@ -43,6 +48,8 @@ export function RepoCard({ repo: r }: { repo: RepoStatus }) {
           )}
           {r.queued > 0 && <span className="muted"> · {r.queued} queued</span>}
         </dd>
+        <dt>Auth</dt>
+        <dd><AuthInfo auth={r.auth} /></dd>
         <dt>Last job</dt>
         <dd>
           {r.last_job ? (

@@ -7,6 +7,7 @@ import {
   FieldTimeOutlined,
   LoadingOutlined,
   MinusCircleOutlined,
+  StopOutlined,
   SyncOutlined,
 } from '@ant-design/icons';
 import { theme, Tooltip } from 'antd';
@@ -103,4 +104,14 @@ export function HealthTag({ health, large }: { health: RepoHealth; large?: boole
 /** Small coloured dot, pulsing when `live`. */
 export function Dot({ color, live, title }: { color: string; live?: boolean; title?: string }) {
   return <span className={`dotmark${live ? ' pulse' : ''}`} style={{ background: color, color }} title={title} aria-hidden={!title} />;
+}
+
+export function DisabledTag({ large }: { large?: boolean }) {
+  const { token } = theme.useToken();
+  return (
+    <Pill tone={{ fg: token.colorTextSecondary, solid: token.colorTextQuaternary }} icon={<StopOutlined />} large={large}
+      hint="Disabled: new jobs are refused and queued jobs fail">
+      disabled
+    </Pill>
+  );
 }

@@ -1,5 +1,5 @@
-// Hand-written mirrors of the admin API shapes. Source of truth: JSDoc in src/jobStore.js and src/repoRegistry.js,
-// and the handlers in src/admin.js. Keep in sync when those change.
+// Hand-written mirrors of the admin API shapes. Source of truth: JSDoc in src/jobStore.js, src/repoRegistry.js and
+// src/repoStore.js (audit), and the handlers in src/admin.js. Keep in sync when those change.
 
 export const JOB_STATUSES = ['queued', 'pulling', 'running', 'succeeded', 'failed', 'timeout'] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
@@ -7,6 +7,27 @@ export const TERMINAL: readonly JobStatus[] = ['succeeded', 'failed', 'timeout']
 export type StatusCounts = Record<JobStatus, number>;
 
 export type RepoHealth = 'ok' | 'syncing' | 'sync_error' | 'never_synced';
+
+export type RepoKind = 'https' | 'ssh' | 'local';
+export interface TokenInfo { set: true; hint: string; updated_at: string }
+export interface RepoAuth { kind: RepoKind; token: TokenInfo | null; ssh_key_path: string | null }
+
+/** POST /admin/api/repos */
+export interface RepoCreate { id: string; url: string; defaultBranch?: string; sshKeyPath?: string; token?: string }
+/** PATCH /admin/api/repos/:id */
+export interface RepoPatch { url?: string; defaultBranch?: string; sshKeyPath?: string; enabled?: boolean; token?: string }
+
+export type AuditAction = 'repo.create' | 'repo.update' | 'repo.enable' | 'repo.disable' | 'repo.delete' | 'token.set' | 'key.rotate' | 'import';
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actor: string;
+  ip: string | null;
+  action: AuditAction | (string & {});
+  repo_id: string | null;
+  details: Record<string, unknown>; // field: {from,to} | token: "set …a1b2" | "dropped" | workspace: "wiped" | ...
+}
+export interface AuditPage { entries: AuditEntry[]; next: number | null }
 
 export interface Summary {
   uptime_s: number;
@@ -41,6 +62,8 @@ export interface RepoStatus {
   running_job_id: string | null;
   queued: number;
   last_job: { id: string; status: JobStatus; created_at: string; finished_at: string | null } | null;
+  enabled: boolean;
+  auth: RepoAuth;
 }
 
 export interface JobSummary {

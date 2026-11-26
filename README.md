@@ -316,10 +316,13 @@ For UI development, run the server (`npm run dev`) and, in another terminal, `np
 - **Overview:** running/queued jobs, 24h outcome counts, and a card per repo: health (`ok`, `sync error`,
   `syncing`, `never synced`), last sync (branch, commit, duration, error), whether it's cloned, what's running now,
   job counts.
-- **Repo** and **Jobs:** job tables filterable by repo and status, with queue/sync/run times, cost and turns.
+- **Repo** and **Jobs:** job tables filterable by repo and status, with queue/sync/run times, cost and turns. The
+  repo page also has enable/disable, token status and an audit log.
 - **Job detail:** status timeline, prompt, result, error, full log, and the live event stream while it runs.
 
-The pages are read-only for now (repo forms come next); repos are managed through the JSON API below.
+Repos can be managed from the dashboard (Overview → **Add repo**; on a repo page: **Edit**, **Set/Replace token**, the
+**Enabled** switch, **Delete** with typed confirmation, and an **Audit** tab), or through the JSON API below. Tokens are
+write-only: the dashboard shows only `…<last 4>`.
 `ADMIN_PASSWORD` is now a write credential: use ≥ 16 characters. Pages have real URLs (`/admin/jobs/<id>`, `/admin/repos/<id>?status=failed`), so they can be
 bookmarked and shared. Admins can read every job's prompt, result and log. Basic auth sends the password with every
 request, so put TLS (a reverse proxy) in front of anything that isn't localhost. The dashboard's JSON API is

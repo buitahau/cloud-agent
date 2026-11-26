@@ -1,12 +1,14 @@
 import {
-  CheckCircleOutlined, ClockCircleOutlined, DatabaseOutlined, PlayCircleOutlined, WarningOutlined,
+  CheckCircleOutlined, ClockCircleOutlined, DatabaseOutlined, PlayCircleOutlined, PlusOutlined, WarningOutlined,
 } from '@ant-design/icons';
-import { Alert, Col, Progress, Row, Skeleton, theme } from 'antd';
+import { Alert, Button, Col, Progress, Row, Skeleton, theme } from 'antd';
+import { useState } from 'react';
 import { Link } from 'react-router';
 import { useRecentJobs, useRepos, useSummary } from '../api/queries';
 import { JobListItem } from '../components/JobListItem';
 import { QueryError } from '../components/QueryError';
 import { RepoCard } from '../components/RepoCard';
+import { RepoFormModal } from '../components/RepoForm';
 import { PageHeader, Panel, StatTile, StatusDistribution } from '../components/ui';
 import { plural, upt } from '../lib/format';
 
@@ -35,6 +37,7 @@ export function OverviewPage() {
   const { token } = theme.useToken();
   const summary = useSummary();
   const repos = useRepos();
+  const [adding, setAdding] = useState(false);
 
   if (summary.error) return <QueryError error={summary.error} what="summary" />;
   if (!summary.data) {
@@ -66,6 +69,7 @@ export function OverviewPage() {
             {s.persistence && <span><DatabaseOutlined /> history saved to disk</span>}
           </>
         }
+        extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setAdding(true)}>Add repo</Button>}
       />
       {!s.persistence && (
         <Alert
@@ -160,7 +164,14 @@ export function OverviewPage() {
       ) : !repos.data ? (
         <Skeleton active />
       ) : repos.data.length === 0 ? (
-        <Panel><div className="empty-note">No repositories configured.</div></Panel>
+        <Panel>
+          <div className="empty-note">
+            No repositories yet.
+            <div style={{ marginTop: 12 }}>
+              <Button type="primary" icon={<PlusOutlined />} onClick={() => setAdding(true)}>Add your first repo</Button>
+            </div>
+          </div>
+        </Panel>
       ) : (
         <Row gutter={[16, 16]}>
           {repos.data.map((r) => (
@@ -170,6 +181,7 @@ export function OverviewPage() {
           ))}
         </Row>
       )}
+      <RepoFormModal mode="create" open={adding} onClose={() => setAdding(false)} />
     </>
   );
 }
