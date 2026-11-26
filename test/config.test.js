@@ -46,6 +46,7 @@ test('minimal valid env (API_KEY + MASTER_KEY) -> defaults applied', () => {
   assert.equal(c.reposFile, path.join(cwd, 'repos.json'));
   assert.equal(c.reposFileExplicit, false);
   assert.equal(c.allowLocalRepos, false);
+  assert.equal(c.trustProxy, false);
   assert.equal(c.sshKeysDir, '/run/ssh-keys');
   assert.equal(c.keyRing.currentKeyId, deriveKeyId(Buffer.from(B1, 'base64')));
   assert.equal(c.keyRing.keyIds.length, 1);
@@ -95,6 +96,8 @@ test('DB_FILE resolved against cwd and may not live inside WORKSPACE_ROOT', () =
 test('ALLOW_LOCAL_REPOS, SSH_KEYS_DIR, REPOS_FILE', () => {
   assert.equal(loadConfig({ ...BASE, ALLOW_LOCAL_REPOS: 'yes' }, { cwd }).allowLocalRepos, true);
   assert.match(problemsOf({ ...BASE, ALLOW_LOCAL_REPOS: 'maybe' })[0], /ALLOW_LOCAL_REPOS/);
+  assert.equal(loadConfig({ ...BASE, TRUST_PROXY: 'yes' }, { cwd }).trustProxy, true);
+  assert.throws(() => loadConfig({ ...BASE, TRUST_PROXY: 'maybe' }, { cwd }), (e) => e instanceof ConfigError && /TRUST_PROXY/.test(e.message));
   assert.equal(loadConfig({ ...BASE, SSH_KEYS_DIR: '~/keys' }, { cwd }).sshKeysDir, path.join(os.homedir(), 'keys'));
   const c = loadConfig({ ...BASE, REPOS_FILE: 'missing.json' }, { cwd });
   assert.equal(c.reposFile, path.join(cwd, 'missing.json'));

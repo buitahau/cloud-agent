@@ -3,7 +3,8 @@
 PoC HTTP service: `POST /<repo>/run-agent` with a prompt → the service pulls the latest commit of the
 chosen branch of that repo and runs `claude -p` (headless, on a Claude subscription) inside it,
 so the repo's own `.claude/` agents, skills and commands apply. Poll `GET /<repo>/run-agent/{id}` for the result.
-Several repos can be configured; a read-only admin dashboard at `/admin/` shows each repo's status and jobs.
+Several repos can be configured; an admin dashboard at `/admin/` shows each repo's status and jobs, and its JSON API
+adds, edits and removes repos.
 
 Spec: [docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md). Design notes: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 Multi-repo + dashboard design: [docs/MULTI_REPO_PLAN.md](docs/MULTI_REPO_PLAN.md).
@@ -31,7 +32,8 @@ cp repos.example.json repos.json  # the target repos, imported once into the dat
 
 Repos and their tokens live in a SQLite database, `DB_FILE` (default `./data/cloud-agent.db`, created with mode
 0600). Tokens are encrypted with `MASTER_KEY` (see [Master key, backups, rotation](#master-key-backups-rotation)).
-Repos are loaded once at startup.
+Repos are managed through the admin API (see [Managing repos](#managing-repos-admin-api)); changes apply
+immediately, no restart.
 
 **First-boot import.** The database is filled once from `repos.json` (path set by `REPOS_FILE`, default
 `./repos.json`) plus the `GIT_TOKEN_<NAME>` env vars it names. The import runs only when the repos table is empty,
@@ -65,8 +67,8 @@ file, the service starts with 0 repos.
   error.
 - Stored repos are re-checked at every startup: an invalid one (e.g. a local repo without `ALLOW_LOCAL_REPOS`) stops
   the service; a missing ssh key file or a missing https token only warns (that repo's jobs fail).
-- **Until the admin write API ships, changing repos = re-import:** keep `repos.json` and its tokens, stop the
-  service, back up the database, move `cloud-agent.db*` aside, and start again.
+- To add, edit, disable or delete repos, or to set a token, use the admin API. The first-boot import only fills an
+  empty database.
 
 Migrating from the single-repo version: `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR` and `GIT_SSH_KEY_PATH` are no
 longer read (startup fails if they are set); a leftover `GIT_TOKEN` is ignored with a warning. Move the repo into
@@ -119,7 +121,7 @@ Ctrl-C / SIGTERM shuts down gracefully: queued jobs are marked failed, running c
 `MASTER_KEY` (base64 of 32 bytes: `openssl rand -base64 32`) is required; startup fails without it, and also fails
 (before the Claude probe) if a stored token can't be decrypted with `MASTER_KEY` / `MASTER_KEY_PREVIOUS`. Keep a copy
 of it **outside** your backups (e.g. a password manager): a backup plus its key is a full set of tokens, and losing
-the key means re-entering (re-importing) every token.
+the key means re-entering every token (`PUT /admin/api/repos/<id>/token`).
 
 Back up with the built-in command, which takes a consistent copy (a plain `cp` of a live WAL database can miss
 committed data). The target must not exist; it is written with mode 0600:
@@ -273,7 +275,7 @@ Run these in `/opt/cloud-agent` on the VPS:
 | Task | Command |
 |---|---|
 | Deploy a new version | push/merge to `main` (CI does the rest) |
-| Add/change a repo | re-import: update `repos.json` + `GIT_TOKEN_*`, `docker compose stop`, back up, move `data/cloud-agent.db*` aside (`docker compose run --rm cloud-agent sh -c 'mkdir -p /app/data/old && mv /app/data/cloud-agent.db* /app/data/old/'`), `docker compose up -d` |
+| Add/change a repo | `curl` the admin API (see [Managing repos](#managing-repos-admin-api)) |
 | Back up repos + tokens | `docker compose exec cloud-agent node src/cli.js backup /app/data/backups/$(date +%F).db` (copy it off the VPS; keep `MASTER_KEY` separately) |
 | Rotate `MASTER_KEY` | new key in `MASTER_KEY`, old in `MASTER_KEY_PREVIOUS`, `docker compose up -d`, then remove `MASTER_KEY_PREVIOUS` (see above) |
 | Change `.env` | edit it, then `docker compose up -d` (`restart` does not re-read `.env`) |
@@ -317,11 +319,59 @@ For UI development, run the server (`npm run dev`) and, in another terminal, `np
 - **Repo** and **Jobs:** job tables filterable by repo and status, with queue/sync/run times, cost and turns.
 - **Job detail:** status timeline, prompt, result, error, full log, and the live event stream while it runs.
 
-It is read-only. Pages have real URLs (`/admin/jobs/<id>`, `/admin/repos/<id>?status=failed`), so they can be
+The pages are read-only for now (repo forms come next); repos are managed through the JSON API below.
+`ADMIN_PASSWORD` is now a write credential: use ≥ 16 characters. Pages have real URLs (`/admin/jobs/<id>`, `/admin/repos/<id>?status=failed`), so they can be
 bookmarked and shared. Admins can read every job's prompt, result and log. Basic auth sends the password with every
 request, so put TLS (a reverse proxy) in front of anything that isn't localhost. The dashboard's JSON API is
 under `/admin/api/` (`summary`, `repos`, `repos/<id>`, `jobs?repo=&status=&limit=&before=`, `jobs/<id>`,
-`jobs/<id>/events`).
+`jobs/<id>/events`, `audit?repo=&limit=&before=`).
+
+### Managing repos (admin API)
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/admin/api/repos` | `{id,url,defaultBranch?,sshKeyPath?,token?}` → 201 + repo status (https needs `token`) |
+| PATCH | `/admin/api/repos/<id>` | `{url?,defaultBranch?,sshKeyPath?,enabled?,token?}` → 200 |
+| PUT | `/admin/api/repos/<id>/token` | `{token}` → 204, never echoed back |
+| DELETE | `/admin/api/repos/<id>` | 204, or 409 |
+| GET | `/admin/api/audit?repo=&limit=&before=` | `{entries, next}` |
+
+**Required headers** on every non-GET request: `Content-Type: application/json` and `X-Admin-Request: 1`. A browser
+`Origin` must match the host, and `Sec-Fetch-Site` must be `same-origin` or absent; otherwise 403. Errors are
+`{"error": "..."}` (validation errors add `problems: [...]`).
+
+**Behind a proxy:** a proxy that rewrites `Host` (nginx's default) needs `proxy_set_header Host $host;` or
+`TRUST_PROXY=true` (which also makes the audit IP the real client). Only set `TRUST_PROXY` if the port is reachable
+through the proxy alone (compose binds 127.0.0.1).
+
+**Rules:**
+- Disabling makes `POST /<id>/run-agent` return 409, fails that repo's queued jobs ("repo disabled") and lets a
+  running job finish.
+- Delete needs no queued or running jobs (disable first). It removes the repo, its token and its clone; job history
+  stays.
+- A URL change is refused while a job runs. A different remote wipes the clone (re-cloned by the next job). Moving to
+  another host (or from ssh/local to https) needs `token` in the same PATCH, because the stored token is bound to the
+  old host.
+- Every change writes an audit row (`repo.create|repo.update|repo.enable|repo.disable|repo.delete|token.set`) and an
+  `[audit]` log line; tokens show only as `set …a1b2`.
+
+curl examples (keep the token out of argv and history):
+
+```bash
+A="$ADMIN_USER:$ADMIN_PASSWORD"; U=http://localhost:8080/admin/api
+H=(-H 'Content-Type: application/json' -H 'X-Admin-Request: 1')
+read -rs TOKEN   # paste the GitHub token, no echo
+printf '{"id":"web","url":"https://github.com/your-org/web.git","defaultBranch":"dev","token":"%s"}' "$TOKEN" \
+  | curl -s -u "$A" "${H[@]}" -X POST "$U/repos" --data-binary @-
+curl -s -u "$A" "${H[@]}" -X POST "$U/repos" -d '{"id":"api","url":"git@github.com:your-org/api.git","sshKeyPath":"/run/ssh-keys/id_ed25519_api"}'
+printf '{"token":"%s"}' "$TOKEN" | curl -s -u "$A" "${H[@]}" -X PUT "$U/repos/web/token" --data-binary @- -w '%{http_code}\n'
+curl -s -u "$A" "${H[@]}" -X PATCH "$U/repos/web" -d '{"enabled":false}'
+curl -s -u "$A" "${H[@]}" -X PATCH "$U/repos/web" -d '{"defaultBranch":"main"}'
+curl -s -u "$A" "${H[@]}" -X DELETE "$U/repos/web" -w '%{http_code}\n'
+curl -s -u "$A" "$U/audit?repo=web&limit=20"
+```
+
+(`printf` is a shell builtin, so the token never appears in `ps`.)
 
 ## API
 
@@ -331,7 +381,7 @@ routes need the `x-api-key` header; `GET /health` is unauthenticated. Unknown re
 | Method | Path | |
 |---|---|---|
 | `GET` | `/repos` | `[{id, default_branch}]` |
-| `POST` | `/<repo>/run-agent` | body `{prompt, branch?}` → `202 {id, status:"queued"}` |
+| `POST` | `/<repo>/run-agent` | body `{prompt, branch?}` → `202 {id, status:"queued"}`; `409 {"error":"repo disabled"}` if the repo is disabled |
 | `GET` | `/<repo>/run-agent?status=&limit=&before=` | `{jobs:[summary…], next}`, newest first; `next` is the `before` cursor of the next page |
 | `GET` | `/<repo>/run-agent/{id}` | the job (404 if it belongs to another repo) |
 | `GET` | `/<repo>/run-agent/{id}/events` | live progress (SSE) |

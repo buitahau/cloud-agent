@@ -14,6 +14,7 @@ import { STATUS, TERMINAL_STATUSES } from './jobStore.js';
  * @property {() => WorkerStats} stats
  * @property {() => Promise<void>} onIdle    resolves when queue is empty AND nothing is running (immediately if idle).
  *                                            Used by tests and graceful shutdown.
+ * @property {() => void} poke   schedule a pump now (e.g. after a repo is disabled, so its queued jobs fail right away)
  * @property {(reason?: string) => Promise<void>} shutdown
  *           Stop accepting work: mark every still-queued job failed (error = reason ?? 'Service shutting down'),
  *           abort every running job's AbortController (claude/git process group gets killed by runProcess),
@@ -32,6 +33,8 @@ import { STATUS, TERMINAL_STATUSES } from './jobStore.js';
  * @typedef {Object} RepoRuntime
  * @property {import('./gitSync.js').GitSync} gitSync
  * @property {string} workspaceDir   cwd for claude
+ * @property {{ enabled?: boolean }} [config]   registry entries carry it; enabled === false fails the repo's queued
+ *           jobs ("repo disabled") when the worker next looks at them. A running job keeps the entry it started with.
  */
 
 /**
@@ -99,20 +102,20 @@ export function createWorker(deps) {
   };
 
   function pump() {
-    for (let i = 0; i < queue.length && running.size < maxConcurrent && !stopped;) {
+    for (let i = 0; i < queue.length && !stopped;) {
       const id = queue[i];
       const job = store.get(id);
       if (!job || job.status !== STATUS.QUEUED) { // vanished (retention) or already handled: drop it
         queue.splice(i, 1);
         continue;
       }
-      if (busyRepos.has(job.repo_id)) { i++; continue; }
-      queue.splice(i, 1);
+      // Looked up at pick time, so a queued job uses the repo as it is NOW (it may have been edited, disabled or
+      // deleted). Unknown/disabled jobs fail before the busy/capacity skips, so they fail even when every slot is full.
       const repo = repos.get(job.repo_id);
-      if (!repo) {
-        failQueued(id, `unknown repo "${job.repo_id}"`);
-        continue;
-      }
+      if (!repo) { queue.splice(i, 1); failQueued(id, `unknown repo "${job.repo_id}"`); continue; }
+      if (repo.config?.enabled === false) { queue.splice(i, 1); failQueued(id, 'repo disabled'); continue; }
+      if (running.size >= maxConcurrent || busyRepos.has(job.repo_id)) { i++; continue; }
+      queue.splice(i, 1);
       start(id, job.repo_id, repo);
     }
   }
@@ -141,6 +144,9 @@ export function createWorker(deps) {
       }
       queue.push(id);
       schedulePump();
+    },
+    poke() {
+      if (!stopped) schedulePump();
     },
     queueLength(repoId) {
       if (repoId === undefined) return queue.length;

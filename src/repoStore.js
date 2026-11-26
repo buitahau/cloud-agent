@@ -1,7 +1,8 @@
 // src/repoStore.js
-// Repos and their encrypted tokens in SQLite (tables from src/db/migrations.js), plus the startup helpers that
-// verify/rotate stored secrets and re-validate stored repos. Write methods never open a transaction: callers
-// wrap them in store.tx(fn) (tx() cannot nest). Never puts token values in error messages or return values
+// Repos and their encrypted tokens in SQLite (tables from src/db/migrations.js), the audit log, plus the startup
+// helpers that verify/rotate stored secrets and re-validate stored repos. Write methods (insert/update/enable/
+// delete repos, set/delete tokens, audit rows) never open a transaction: callers wrap them in store.tx(fn) (tx()
+// cannot nest). Never puts token values in error messages or return values
 // other than getToken().
 
 import fs from 'node:fs';
@@ -74,6 +75,13 @@ export function createRepoStore({ db, keyRing, now = () => new Date().toISOStrin
     getMeta: db.prepare('SELECT value FROM meta WHERE key = ?'),
     setMeta: db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value'),
     insertAudit: db.prepare('INSERT INTO audit_log (at,actor,ip,action,repo_id,details) VALUES (?,?,?,?,?,?)'),
+    updateRepo: db.prepare('UPDATE repos SET url=?, kind=?, default_branch=?, ssh_key_path=?, updated_at=? WHERE id=?'),
+    setEnabled: db.prepare('UPDATE repos SET enabled=?, updated_at=? WHERE id=?'),
+    deleteRepo: db.prepare('DELETE FROM repos WHERE id=?'),
+    deleteSecret: db.prepare('DELETE FROM repo_secrets WHERE repo_id=? AND name=?'),
+    listAudit: db.prepare(
+      'SELECT * FROM audit_log WHERE (? IS NULL OR repo_id = ?) AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?',
+    ),
   };
 
   return {
@@ -134,6 +142,22 @@ export function createRepoStore({ db, keyRing, now = () => new Date().toISOStrin
       q.upsertSecret.run(id, TOKEN, enc.alg, enc.key_id, enc.iv, enc.ciphertext, enc.tag, enc.hint, updatedAt);
       return { hint: enc.hint, updatedAt };
     },
+    /** @param {string} id @param {import('./lib/repoValidate.js').ValidRepo} repo  validated; no transaction opened */
+    updateRepo(id, repo) {
+      q.updateRepo.run(repo.url, repo.kind, repo.defaultBranch, repo.sshKeyPath ?? null, now(), id);
+    },
+    /** @param {string} id @param {boolean} enabled */
+    setEnabled(id, enabled) {
+      q.setEnabled.run(enabled ? 1 : 0, now(), id);
+    },
+    /** Deletes the row; its repo_secrets go by ON DELETE CASCADE. @param {string} id */
+    deleteRepo(id) {
+      q.deleteRepo.run(id);
+    },
+    /** @param {string} id @param {string} [name=TOKEN] */
+    deleteSecret(id, name = TOKEN) {
+      q.deleteSecret.run(id, name);
+    },
     /** @param {string} key @param {string} value */
     setMeta(key, value) {
       q.setMeta.run(key, value);
@@ -141,6 +165,20 @@ export function createRepoStore({ db, keyRing, now = () => new Date().toISOStrin
     /** @param {{ actor: string, action: string, repoId?: string|null, ip?: string|null, details?: object }} e  never secrets */
     insertAudit({ actor, action, repoId = null, ip = null, details = {} }) {
       q.insertAudit.run(now(), actor, ip, action, repoId, JSON.stringify(details));
+    },
+    /**
+     * Audit entries, newest first. `before` = audit id cursor (exclusive).
+     * @param {{ repoId?: string|null, limit?: number, before?: number|null }} [o]
+     * @returns {{ entries: Array<{ id: number, at: string, actor: string, ip: string|null, action: string, repo_id: string|null, details: object }>, next: number|null }}
+     */
+    listAudit({ repoId = null, limit = 50, before = null } = {}) {
+      const rows = q.listAudit.all(repoId, repoId, before, before, limit + 1);
+      const page = rows.slice(0, limit).map((r) => {
+        let details = {};
+        try { details = JSON.parse(r.details); } catch { /* keep {} */ }
+        return { id: Number(r.id), at: r.at, actor: r.actor, ip: r.ip ?? null, action: r.action, repo_id: r.repo_id ?? null, details };
+      });
+      return { entries: page, next: rows.length > limit ? page[page.length - 1].id : null };
     },
 
     /** @returns {{ repoId: string, name: string, reason: string }[]} every stored secret that cannot be decrypted */

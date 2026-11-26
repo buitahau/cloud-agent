@@ -1,15 +1,24 @@
 // Covers: T3 (status progression), T11 (sequential FIFO, one at a time), T9 (failure keeps worker alive),
 // T10 (timeout status end-to-end through the worker), T12 (job 2 clean after job 1 junk).
+// Also: disabled repos fail their queued jobs at the next pump (poke), entry swaps while a job runs, and a URL
+// change through the real registry wipes and re-clones.
 // Uses real jobStore + real gitSync (gitFixture) + real claudeRunner pointed at fake-claude; or stubs where noted.
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createWorker, processJob } from '../src/worker.js';
 import { createJobStore } from '../src/jobStore.js';
 import { createGitSync, GitSyncError } from '../src/gitSync.js';
 import { createClaudeRunner } from '../src/claudeRunner.js';
 import { createGitFixture, FAKE_CLAUDE } from '../test-support/gitFixture.js';
+import { createRepoRegistry } from '../src/repoRegistry.js';
+import { createRepoStore } from '../src/repoStore.js';
+import { openDb, closeDb } from '../src/db.js';
+import { migrate } from '../src/db/migrations.js';
+import { createKeyRing } from '../src/secrets.js';
 
 const silent = { info() {}, warn() {}, error() {} };
 const tick = () => new Promise((r) => setImmediate(r));
@@ -325,7 +334,9 @@ function multiRepoDeps(repoIds, maxConcurrent) {
   const started = [];
   let active = 0;
   let maxActive = 0;
-  const repos = new Map(repoIds.map((id) => [id, { gitSync: { sync: async () => ({ commit: id }) }, workspaceDir: `/ws/${id}` }]));
+  const repos = new Map(repoIds.map((id) => [
+    id, { config: { enabled: true }, gitSync: { sync: async () => ({ commit: id }) }, workspaceDir: `/ws/${id}` },
+  ]));
   const claudeRunner = {
     run: ({ prompt, cwd, signal }) => {
       active++; maxActive = Math.max(maxActive, active);
@@ -340,7 +351,7 @@ function multiRepoDeps(repoIds, maxConcurrent) {
   const submit = (repoId, prompt) => { const j = store.create({ prompt, branch: 'main', repoId }); worker.enqueue(j.id); return j; };
   const release = (prompt) => gates.get(prompt).resolve(okOutcome(prompt));
   const settle = async () => { for (let i = 0; i < 6; i++) await tick(); };
-  return { store, worker, submit, release, settle, started, maxActive: () => maxActive };
+  return { store, worker, repos, submit, release, settle, started, maxActive: () => maxActive };
 }
 
 test('multi-repo: two repos with maxConcurrent=2 run in parallel, each in its own workspace', async () => {
@@ -456,4 +467,112 @@ test('multi-repo (real git + fake claude): each job runs in its own repo workspa
     assert.match(ja.result, /repo-a/);
     assert.match(jb.result, /repo-b/);
   } finally { fa.cleanup(); fb.cleanup(); }
+});
+
+test('disabled repo: its queued job fails at the next pump (poke), the running job finishes', async () => {
+  const m = multiRepoDeps(['a'], 2);
+  const a1 = m.submit('a', 'a1');
+  const a2 = m.submit('a', 'a2');
+  await m.settle();
+  assert.deepEqual([a1.status, a2.status], ['running', 'queued']);
+  m.repos.get('a').config.enabled = false;
+  m.worker.poke();
+  await m.settle();
+  assert.equal(a2.status, 'failed');
+  assert.equal(a2.error, 'repo disabled');
+  assert.equal(a1.status, 'running');
+  m.release('a1');
+  await m.worker.onIdle();
+  assert.equal(a1.status, 'succeeded');
+});
+
+test('disabled repo: queued job fails even while every slot is full', async () => {
+  const m = multiRepoDeps(['a', 'b'], 1);
+  const b1 = m.submit('b', 'b1');
+  const a1 = m.submit('a', 'a1');
+  await m.settle();
+  assert.deepEqual([b1.status, a1.status], ['running', 'queued']);
+  m.repos.get('a').config.enabled = false;
+  m.worker.poke();
+  await m.settle();
+  assert.equal(a1.status, 'failed');
+  assert.equal(a1.error, 'repo disabled');
+  assert.equal(b1.status, 'running');
+  m.release('b1');
+  await m.worker.onIdle();
+});
+
+test('disabled then re-enabled before the pick: the queued job runs', async () => {
+  const m = multiRepoDeps(['a'], 1);
+  const a1 = m.submit('a', 'a1');
+  const a2 = m.submit('a', 'a2');
+  await m.settle();
+  m.repos.get('a').config.enabled = false;
+  m.repos.get('a').config.enabled = true;
+  m.worker.poke();
+  await m.settle();
+  assert.equal(a2.status, 'queued');
+  m.release('a1');
+  await m.settle();
+  assert.equal(a2.status, 'running');
+  m.release('a2');
+  await m.worker.onIdle();
+  assert.deepEqual([a1.status, a2.status], ['succeeded', 'succeeded']);
+});
+
+test('entry swapped while a job runs: that job keeps its snapshot, the next job uses the new entry', async () => {
+  const m = multiRepoDeps(['a'], 1);
+  let calls1 = 0;
+  let calls2 = 0;
+  m.repos.set('a', { config: { enabled: true }, gitSync: { sync: async () => { calls1++; return { commit: 'c1' }; } }, workspaceDir: '/ws/old' });
+  const j1 = m.submit('a', 'j1');
+  await m.settle();
+  assert.equal(j1.status, 'running');
+  m.repos.set('a', { config: { enabled: true }, gitSync: { sync: async () => { calls2++; return { commit: 'c2' }; } }, workspaceDir: '/ws/new' });
+  const j2 = m.submit('a', 'j2');
+  m.release('j1');
+  await m.settle();
+  assert.equal(j2.status, 'running');
+  assert.deepEqual(m.started.map((s) => s.cwd), ['/ws/old', '/ws/new']);
+  assert.equal(calls1, 1);
+  assert.equal(calls2, 1);
+  assert.equal(j1.commit, 'c1');
+  assert.equal(j2.commit, 'c2');
+  m.release('j2');
+  await m.worker.onIdle();
+});
+
+test('registry (real git): a URL change to a different remote wipes and re-clones', async () => {
+  const fa = createGitFixture();
+  const fb = createGitFixture();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wk-reg-'));
+  const db = openDb(':memory:');
+  after(() => closeDb(db));
+  try {
+    fa.commit('main', 'WHO.txt', 'repo-a\n');
+    fb.commit('main', 'WHO.txt', 'repo-b\n');
+    migrate(db);
+    const repoStore = createRepoStore({ db, keyRing: createKeyRing(crypto.randomBytes(32)) });
+    const store = createJobStore();
+    const reg = createRepoRegistry({ repoStore, jobs: store, workspaceRoot: root, gitTimeoutMs: 30_000, allowLocal: true, log: silent });
+    const CTX = { actor: 'ops', ip: null };
+    const claudeRunner = createClaudeRunner({ claudeBin: FAKE_CLAUDE, permissionMode: 'bypassPermissions', maxTurns: 5, timeoutMs: 10_000, killGraceMs: 200 });
+    const worker = createWorker({ store, repos: reg, claudeRunner, logger: silent });
+    const run = async () => {
+      const j = store.create({ prompt: '[[fake:cat=WHO.txt]]', branch: 'main', repoId: 'r' });
+      worker.enqueue(j.id);
+      await worker.onIdle();
+      return j;
+    };
+    reg.create({ id: 'r', url: fa.originUrl }, CTX);
+    const j1 = await run();
+    assert.equal(j1.status, 'succeeded', j1.error);
+    assert.match(j1.result, /repo-a/);
+    reg.update('r', { url: fb.originUrl }, CTX);
+    const j2 = await run();
+    assert.equal(j2.status, 'succeeded', j2.error);
+    assert.match(j2.result, /repo-b/);
+    const row = db.prepare("SELECT details FROM audit_log WHERE action = 'repo.update'").get();
+    assert.equal(JSON.parse(row.details).workspace, 'wiped');
+  } finally { fa.cleanup(); fb.cleanup(); fs.rmSync(root, { recursive: true, force: true }); }
 });
