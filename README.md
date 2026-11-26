@@ -59,7 +59,11 @@ reused; delete it, since each repo is re-cloned under `./workspaces/<id>`.
 No Claude token or API key is configured. The service uses the subscription login stored in `~/.claude` of
 the OS user that runs it, so start it as **that same user** (same `HOME`). `ANTHROPIC_API_KEY`,
 `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are stripped from claude's environment, so the machine
-login is always what gets used and billed.
+login is always what gets used and billed. The service's own secrets (`API_KEY`, `ADMIN_PASSWORD`,
+`MASTER_KEY`, `MASTER_KEY_PREVIOUS`, every repo's `auth.tokenEnv` variable and any `GIT_TOKEN`/`GIT_TOKEN_*`)
+are also removed from the environment of claude and of git; git gets the repo's token only as an origin-scoped
+auth header, and always runs with `GIT_TRACE_REDACT=1`. This is not a sandbox: claude runs as the same OS user
+as the service.
 
 At startup the service checks `claude --version`, `claude auth status` (must be logged in with
 `authMethod: "claude.ai"`), and (with `CLAUDE_AUTH_PROBE=true`,

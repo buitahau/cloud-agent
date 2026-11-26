@@ -35,7 +35,7 @@ import { STATUS } from './jobStore.js';
 
 /**
  * @param {ReadonlyArray<import('./config.js').RepoConfig>} repos
- * @param {{ gitTimeoutMs: number, gitSyncFactory?: typeof createGitSync }} opts
+ * @param {{ gitTimeoutMs: number, secretEnvNames?: string[], gitSyncFactory?: typeof createGitSync }} opts
  */
 export function createRepoRegistry(repos, opts) {
   const factory = opts.gitSyncFactory ?? createGitSync;
@@ -51,6 +51,7 @@ export function createRepoRegistry(repos, opts) {
         sshKeyPath: r.sshKeyPath ?? null,
         token: r.token ?? null,
         timeoutMs: opts.gitTimeoutMs,
+        secretEnvNames: opts.secretEnvNames ?? [],
       }),
     });
   }

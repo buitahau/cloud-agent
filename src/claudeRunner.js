@@ -5,6 +5,7 @@
 // Covers T3/T5/T7/T8 (happy path), T9 (failure), T10 (timeout kill).
 
 import { runProcess } from './lib/processRunner.js';
+import { withoutSecrets } from './lib/secretEnv.js';
 
 /** Env vars removed from the child env (see buildClaudeEnv). */
 export const STRIPPED_ENV_VARS = Object.freeze([
@@ -47,6 +48,7 @@ export const STRIPPED_ENV_VARS = Object.freeze([
  * @property {number}      [killGraceMs]          passed to run (tests use small values)
  * @property {import('./lib/processRunner.js').RunFn} [run=runProcess]
  * @property {NodeJS.ProcessEnv} [baseEnv=process.env]
+ * @property {string[]} [secretEnvNames=[]]   env var names to hide from claude (repo tokenEnv names)
  */
 
 /**
@@ -61,7 +63,7 @@ export const STRIPPED_ENV_VARS = Object.freeze([
  *
  * run({ prompt, cwd, log, signal }):
  *  1. log("[claude] $ <claudeBin> <args joined by space>")  (prompt is NOT in args; see buildClaudeArgs)
- *  2. r = await run({ cmd: claudeBin, args: buildClaudeArgs(...), cwd, env: buildClaudeEnv(...),
+ *  2. r = await run({ cmd: claudeBin, args: buildClaudeArgs(...), cwd, env: buildClaudeEnv(baseEnv, secretEnvNames),
  *                     stdin: prompt, timeoutMs, killGraceMs, signal, lineStdout: true,
  *                     onLine: stderr -> log(`[claude:stderr] ${l}`); stdout -> JSON.parse, onEvent(...toEvents) })
  *  3. parsed = the `result` line seen while streaming (immune to the capture cap) ?? parseClaudeJson(r.stdout)
@@ -81,6 +83,7 @@ export function createClaudeRunner(opts) {
     killGraceMs,
     run = runProcess,
     baseEnv = process.env,
+    secretEnvNames = [],
   } = opts;
   const args = buildClaudeArgs({ permissionMode, maxTurns });
 
@@ -107,7 +110,7 @@ export function createClaudeRunner(opts) {
           cmd: claudeBin,
           args,
           cwd,
-          env: buildClaudeEnv(baseEnv),
+          env: buildClaudeEnv(baseEnv, secretEnvNames),
           stdin: prompt,
           timeoutMs,
           killGraceMs,
@@ -153,14 +156,14 @@ export function buildClaudeArgs(p) {
 }
 
 /**
- * Child env: copy of baseEnv minus STRIPPED_ENV_VARS, so claude always authenticates with the
- * subscription login already stored in ~/.claude for the user running this service (HOME must point there).
- * Never mutates baseEnv.
+ * Child env: baseEnv minus service secrets (withoutSecrets: API_KEY, ADMIN_PASSWORD, MASTER_KEY*, GIT_TOKEN*,
+ * secretEnvNames) and minus STRIPPED_ENV_VARS (so the ~/.claude subscription login is used). Never mutates baseEnv.
  * @param {NodeJS.ProcessEnv} baseEnv
+ * @param {Iterable<string>} [secretEnvNames=[]]  configured repos' auth.tokenEnv names
  * @returns {NodeJS.ProcessEnv}
  */
-export function buildClaudeEnv(baseEnv) {
-  const env = { ...baseEnv };
+export function buildClaudeEnv(baseEnv, secretEnvNames = []) {
+  const env = withoutSecrets(baseEnv, secretEnvNames);
   for (const k of STRIPPED_ENV_VARS) delete env[k];
   return env;
 }

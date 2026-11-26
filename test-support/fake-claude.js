@@ -28,7 +28,8 @@
 // user (tool_result), then the result line. With `--output-format json` (auth probe) only the result object.
 // FAKE_CLAUDE_AUTH=invalid makes every -p call return the real 401 shape (is_error:true, exit 1) — T1.
 // If $FAKE_CLAUDE_RECORD is set, appends one JSON line per invocation:
-//   { argv, cwd, stdin, env: { CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, CLAUDECODE } }   (values or null)
+//   { argv, cwd, stdin, env: { CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, CLAUDECODE }, envKeys }
+//   (env: values or null; envKeys: sorted names of every variable in its environment, never values)
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -60,6 +61,7 @@ function record(stdin) {
       ANTHROPIC_API_KEY: pick('ANTHROPIC_API_KEY'),
       CLAUDECODE: pick('CLAUDECODE'),
     },
+    envKeys: Object.keys(process.env).sort(),
   }) + '\n');
 }
 

@@ -39,6 +39,17 @@ test('buildClaudeEnv strips API key / auth token / OAuth token / nesting vars so
   assert.deepEqual(base, snapshot);
 });
 
+test("buildClaudeEnv hides service secrets and the repos' tokenEnv names; no mutation", () => {
+  const base = {
+    PATH: '/bin', API_KEY: 'k', ADMIN_PASSWORD: 'p', MASTER_KEY: 'm', MASTER_KEY_PREVIOUS: 'mp', GIT_TOKEN: 't',
+    GIT_TOKEN_WEB: 'w', MY_PAT: 'x', ADMIN_USER: 'admin', GIT_AUTHOR_NAME: 'a', KEEP: 'x',
+  };
+  const snapshot = { ...base };
+  assert.deepEqual(buildClaudeEnv(base, ['MY_PAT']), { PATH: '/bin', ADMIN_USER: 'admin', GIT_AUTHOR_NAME: 'a', KEEP: 'x' });
+  assert.equal(buildClaudeEnv(base).MY_PAT, 'x');
+  assert.deepEqual(base, snapshot);
+});
+
 test('parseClaudeJson: single object; warning lines before JSON; garbage -> null; non-result object -> null', () => {
   const obj = resultJson();
   assert.deepEqual(parseClaudeJson(JSON.stringify(obj)), obj);
@@ -156,7 +167,11 @@ test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD show
       ...baseOpts,
       permissionMode: 'acceptEdits',
       maxTurns: 7,
-      baseEnv: { ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'should-go', CLAUDECODE: '1', CLAUDE_CODE_OAUTH_TOKEN: 'should-go' },
+      baseEnv: {
+        ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'should-go', CLAUDECODE: '1', CLAUDE_CODE_OAUTH_TOKEN: 'should-go',
+        API_KEY: 'k', ADMIN_PASSWORD: 'p', MASTER_KEY: 'm', GIT_TOKEN_OTHER: 'o', MY_PAT: 'x',
+      },
+      secretEnvNames: ['MY_PAT'],
     });
     const out = await runner.run({ prompt: '-starts with dash [[fake:pwd]]', cwd: work });
     assert.equal(out.outcome, 'succeeded');
@@ -166,6 +181,10 @@ test('via fake: cwd is passed through ([[fake:pwd]]) and FAKE_CLAUDE_RECORD show
     assert.equal(entry.stdin, '-starts with dash [[fake:pwd]]');
     assert.equal(entry.cwd, work);
     assert.deepEqual(entry.env, { CLAUDE_CODE_OAUTH_TOKEN: null, ANTHROPIC_API_KEY: null, CLAUDECODE: null });
+    for (const k of ['API_KEY', 'ADMIN_PASSWORD', 'MASTER_KEY', 'GIT_TOKEN_OTHER', 'MY_PAT']) {
+      assert.ok(!entry.envKeys.includes(k), `${k} reached claude`);
+    }
+    assert.ok(entry.envKeys.includes('PATH'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

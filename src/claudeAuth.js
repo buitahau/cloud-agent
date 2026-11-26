@@ -3,7 +3,8 @@
 //
 // Auth model: the service uses the Claude subscription already logged in on this machine (`claude` → /login),
 // stored in ~/.claude of the OS user running the service. No token is configured; token/API-key env vars are
-// stripped (see buildClaudeEnv) so that login is always what claude uses.
+// stripped (see buildClaudeEnv) so that login is always what claude uses. The service's own secrets (API_KEY,
+// ADMIN_PASSWORD, MASTER_KEY*, git tokens) are stripped too.
 //
 // Why a probe too: `claude auth status --json` only checks that stored credentials exist, not that they still
 // work (e.g. a revoked session). By default we also run a 1-turn probe (CLAUDE_AUTH_PROBE=true). A bad login
@@ -37,7 +38,7 @@ export class ClaudeAuthError extends Error {
  */
 
 /**
- * Steps (each via `run`, env = buildClaudeEnv(baseEnv), timeoutMs = AUTH_STEP_TIMEOUT_MS):
+ * Steps (each via `run`, env = buildClaudeEnv(baseEnv, secretEnvNames), timeoutMs = AUTH_STEP_TIMEOUT_MS):
  *  1. binary:  `<claudeBin> --version`               spawnError/code!=0 -> ClaudeAuthError('binary', `cannot run ${claudeBin}: ...`)
  *  2. status:  `<claudeBin> auth status --json`      parse stdout JSON; require .loggedIn === true and .authMethod === "claude.ai"
  *                                                    (exit code is 1 when logged out) -> else ClaudeAuthError('status', ...)
@@ -52,6 +53,7 @@ export class ClaudeAuthError extends Error {
  * @param {boolean}     [opts.probe=true]
  * @param {import('./lib/processRunner.js').RunFn} [opts.run=runProcess]
  * @param {NodeJS.ProcessEnv} [opts.baseEnv=process.env]
+ * @param {string[]} [opts.secretEnvNames=[]]  repos' auth.tokenEnv names, hidden from claude
  * @returns {Promise<AuthCheckResult>}
  * @throws {ClaudeAuthError}
  */
@@ -61,8 +63,8 @@ const lastLine = (text) => {
 };
 
 export async function checkClaudeAuth(opts) {
-  const { claudeBin, probe = true, run = runProcess, baseEnv = process.env } = opts;
-  const env = buildClaudeEnv(baseEnv);
+  const { claudeBin, probe = true, run = runProcess, baseEnv = process.env, secretEnvNames = [] } = opts;
+  const env = buildClaudeEnv(baseEnv, secretEnvNames);
   const hint = 'log in to your Claude subscription on this machine: run `claude`, then /login, as the same OS user that runs this service';
 
   // 1. binary

@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runProcess } from './lib/processRunner.js';
 import { isValidBranchName } from './lib/validate.js';
+import { withoutSecrets } from './lib/secretEnv.js';
 
 /**
  * Thrown for any git failure. `step` names the failing command so the job error is readable.
@@ -34,6 +35,7 @@ export class GitSyncError extends Error {
  * @property {string}      [gitBin='git']
  * @property {import('./lib/processRunner.js').RunFn} [run=runProcess]
  * @property {NodeJS.ProcessEnv} [baseEnv=process.env]
+ * @property {string[]} [secretEnvNames=[]]  env var names to hide from git (repo tokenEnv names)
  */
 
 /**
@@ -82,13 +84,14 @@ export function createGitSync(opts) {
     gitBin = 'git',
     run = runProcess,
     baseEnv = process.env,
+    secretEnvNames = [],
   } = opts;
 
   return {
     async sync(branch, log = () => {}, signal) {
       const safeLog = (line) => { try { log(line); } catch { /* ignore */ } };
       if (!isValidBranchName(branch)) throw new GitSyncError('validate', 'invalid branch name');
-      const env = buildGitEnv({ baseEnv, repoUrl, sshKeyPath, token });
+      const env = buildGitEnv({ baseEnv, repoUrl, sshKeyPath, token, secretEnvNames });
 
       const git = async (step, args, cwd) => {
         if (signal?.aborted) throw new GitSyncError(step, 'aborted');
@@ -150,8 +153,11 @@ export function createGitSync(opts) {
 /**
  * Build the child env for git. Never mutates baseEnv. Secrets go in env, never in argv or .git/config.
  *
+ *  - baseEnv minus service secrets (withoutSecrets); the repo's own token reaches git only via GIT_CONFIG_VALUE_0.
  *  - Always: GIT_TERMINAL_PROMPT=0 (never hang on a credential prompt) and
  *    GIT_ALLOW_PROTOCOL=https:ssh:file (no ext::/fd::/git:// transports, also for submodules).
+ *  - Always GIT_TRACE_REDACT=1 (overrides the operator's value) so GIT_TRACE_CURL/GIT_TRACE_PACKET can't write
+ *    the Authorization header into job logs.
  *  - If sshKeyPath: GIT_SSH_COMMAND = `ssh -i '<sshKeyPath>' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`
  *    (single-quote the path; reject paths containing a single quote).
  *  - If token AND repoUrl starts with "https://": inject an auth header via git's env-config (git >= 2.31),
@@ -161,11 +167,16 @@ export function createGitSync(opts) {
  *      GIT_CONFIG_VALUE_0=`Authorization: Basic ${base64('x-access-token:' + token)}`
  *    (works for GitHub PATs and GitHub App tokens).
  *
- * @param {{ baseEnv: NodeJS.ProcessEnv, repoUrl: string, sshKeyPath?: string|null, token?: string|null }} p
+ * @param {{ baseEnv: NodeJS.ProcessEnv, repoUrl: string, sshKeyPath?: string|null, token?: string|null, secretEnvNames?: Iterable<string> }} p
  * @returns {NodeJS.ProcessEnv}
  */
 export function buildGitEnv(p) {
-  const env = { ...p.baseEnv, GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'https:ssh:file' };
+  const env = {
+    ...withoutSecrets(p.baseEnv, p.secretEnvNames ?? []),
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ALLOW_PROTOCOL: 'https:ssh:file',
+    GIT_TRACE_REDACT: '1',
+  };
   if (p.sshKeyPath) {
     if (p.sshKeyPath.includes("'")) throw new GitSyncError('validate', 'sshKeyPath must not contain a single quote');
     env.GIT_SSH_COMMAND = `ssh -i '${p.sshKeyPath}' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
