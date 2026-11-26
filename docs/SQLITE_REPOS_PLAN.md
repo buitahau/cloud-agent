@@ -1,6 +1,7 @@
 # Plan: Repos in SQLite + encrypted per-repo tokens
 
-Status: **proposed**. Produced by an Opus planning pass over the codebase at commit 1b70977. The decisions in §0
+Status: **implemented** (PRs 0–5; PR 6 optional, not started). Produced by an Opus planning pass over the codebase
+at commit 1b70977; the "As built" notes in §10 record where the code differs. The decisions in §0
 were accepted, and they override the rest of this document wherever the two differ. Each PR in §10 updates the
 README as it ships.
 
@@ -11,7 +12,7 @@ README as it ships.
 | 1 | Where repo config lives | **SQLite** (`node:sqlite`), one file in the `data` volume (`DB_FILE`, default `./data/cloud-agent.db`). |
 | 2 | Where secrets live | **Encrypted columns in the DB** (AES-256-GCM). The master key is `MASTER_KEY` in `.env`. No external vault. |
 | 3 | Token scope | **Each repo has its own GitHub token**, stored encrypted with that repo. No global or fallback token. |
-| 4 | How repos are created/edited | **Admin write API + dashboard UI**, plus a **one-time import of `repos.json` + `GIT_TOKEN_*` on first boot**. No CLI that edits repos. |
+| 4 | How repos are created/edited | **Admin write API + dashboard UI**, plus a **one-time import of `repos.json` + `GIT_TOKEN_*` on first boot**. No CLI that edits repos. *Amended in PR 5:* the first-boot import was replaced by `node src/cli.js import <file>`, which only fills an empty database (it still edits nothing). |
 | 5 | Repo management through the `x-api-key` API | **No.** Admin (Basic auth) only, for now. |
 | 6 | `jobs.jsonl` → SQLite | **Later**, separate PR (§10 PR 6). |
 | 7 | ssh keys | **Stay files**; the DB stores only `ssh_key_path`, restricted to `SSH_KEYS_DIR`. Encrypted keys in the DB are optional later. |
@@ -272,6 +273,10 @@ first-boot import. The CSP `form-action 'none'` stays.
 - Once the DB has rows, `REPOS_FILE` and `GIT_TOKEN_*` are ignored with a warning. They still leak into claude's env
   if left in `.env`; PR 0 strips the ones it knows about.
 
+**As built (PR 5):** no startup import. `node src/cli.js import <file>` does the same validation and transaction into
+an empty DB only (audit actor `cli`). Leftover `REPOS_FILE` / `GIT_TOKEN*` are a `ConfigError`. Arbitrary-named
+leftovers are found by value (`findEnvVarsHoldingTokens`), warned about and stripped.
+
 ## 8. Deploy
 
 CI deploys automatically on merge and overwrites the VPS compose file.
@@ -283,7 +288,8 @@ CI deploys automatically on merge and overwrites the VPS compose file.
 3. **After the import is confirmed in the logs:** remove `GIT_TOKEN_*` from `.env`, then run `docker compose up -d`.
 4. **Release N+1 (PR 5):** remove the `repos.json` mount. If the host file is missing, Docker creates a *directory*
    at that path, so the mount shouldn't outlive its use. A leftover `REPOS_FILE` or `GIT_TOKEN_*` becomes a startup
-   error.
+   error. As built: the error is unconditional (the service never reads these variables) and names every one.
+   Operators who skipped release N import with the CLI (README "Upgrading…").
 
 Other deploy points:
 - **Permissions:** the `data` volume is already owned by uid 1000 (`Dockerfile`), and the DB and WAL files are 0600.
@@ -340,7 +346,7 @@ Other deploy points:
   - a wrong key exits 1 naming the repo;
   - a token never appears in stdout or stderr;
   - `cleanEnv` also strips `MASTER_KEY|DB_FILE|WORKSPACE_ROOT`.
-- **`npm run test:web`** (tsc) covers the UI. **`e2e.test.js`** imports `repos.json` into a temp DB.
+- **`npm run test:web`** (tsc) covers the UI. **`e2e.test.js`** runs against a `VACUUM INTO` copy of `DB_FILE`.
 
 ## 10. Implementation order (each PR keeps `npm test` green)
 
@@ -351,7 +357,7 @@ Other deploy points:
 | **2. Repos come from SQLite** (read-only at runtime) | Extract `repoValidate`; add `repoStore`, first-boot import, key check + rotation at startup, `getToken`, config/env changes, compose/README/.env.example updates, `cli.js backup` | C `src/lib/repoValidate.js`, `src/repoStore.js`, `src/repoImport.js`, `src/cli.js`, tests; M `src/config.js`, `src/repoRegistry.js`, `src/gitSync.js`, `src/index.js`, `docker-compose.yml`, `.env.example`, `README.md`, `test/config.test.js`, `test/startup.test.js`, `test/e2e.test.js` | Deploy order (`MASTER_KEY` first); a failed import causes a restart loop. Keep the compose mount. As built: `MASTER_KEY` always required (even with an empty DB); `ALLOW_LOCAL_REPOS` and `SSH_KEYS_DIR` apply to the import and to stored repos alike; a missing `REPOS_FILE` with an empty DB starts with 0 repos; git hardened via forced `GIT_CONFIG_*` (hooks, fsmonitor, credential helpers, askPass off), per-kind `GIT_ALLOW_PROTOCOL` and `fetch --upload-pack=git-upload-pack`. |
 | **3. Mutable registry + admin write API + CSRF + audit** | §5 and §6, server side | M `src/repoRegistry.js`, `src/worker.js`, `src/server.js`, `src/admin.js`; C `src/lib/csrf.js`; tests | Races between workspace wipe and a running job (guarded by the 409 rules). As built: a disabled repo's queued jobs fail at the worker's next pump, which `PATCH` triggers via `worker.poke()`; `PATCH` accepts `token` (required when the URL moves to another host or to https); `TRUST_PROXY` (default false) makes the CSRF check compare `X-Forwarded-Host`/`-Proto` (without it only `Origin`'s host:port is compared with `Host`) and sets Express `trust proxy` for the audit IP; the CSRF check covers every non-GET request under `/admin`, unknown paths included; `GET /admin/api/audit` returns `{entries,next}` with the audit id as cursor; create does not wipe a leftover workspace; no `web/` change (the `sendJson()` header contract is in `src/lib/csrf.js`). |
 | **4. Dashboard repo management** | Add/edit form, token modal, enable toggle, delete confirmation, audit tab | M `web/src/api/{client,queries,types}.ts`, `web/src/pages/{RepoPage,OverviewPage}.tsx`, `web/src/components/RepoCard.tsx`; C `web/src/components/RepoForm.tsx`, `TokenModal.tsx` | Low. As built: `sendJson()` sends both CSRF headers on every method (DELETE included), returns `undefined` on 204, and errors carry `ApiError.problems`; token-bearing mutations use `gcTime: 0` and are created inside the modal body (`destroyOnHidden`), so the token lives no longer than the form; the edit form never sends `enabled` (a separate switch with a confirm does); the token field's required state mirrors `repoRegistry.update()` (`web/src/lib/repoRules.ts`); the Audit tab lives on the repo page; extra files `web/src/components/{RepoActions,AuditLog,RepoAuth}.tsx`, `web/src/lib/repoRules.ts`; also M `web/src/layout/AppLayout.tsx`, `web/src/lib/format.ts`, `web/src/components/{QueryError,StatusTag}.tsx`, `web/src/index.css`. |
-| **5. Cleanup (release N+1)** | Remove the `repos.json` mount; leftover `REPOS_FILE` / `GIT_TOKEN_*` become startup errors | M `docker-compose.yml`, `src/config.js`, `README.md` | Operators who skipped step 3 of §8 |
+| **5. Cleanup (release N+1)** | Remove the `repos.json` mount; leftover `REPOS_FILE` / `GIT_TOKEN_*` become startup errors | M `docker-compose.yml`, `src/config.js`, `src/index.js`, `src/repoImport.js`, `src/repoStore.js`, `src/cli.js`, `.env.example`, `README.md`, `docs/architecture/ARCHITECTURE.md`, `docs/PROJECT_OVERVIEW.md`, tests | Operators who skipped step 3 of §8. As built: startup import removed; `cli.js import` (empty DB, atomic); `REPOS_FILE`, `GIT_TOKEN`, `GIT_TOKEN_*` and the single-repo vars are one fatal "no longer read" `ConfigError` regardless of DB state; `reposFile`/`reposFileExplicit`/`collectTokenEnvNames` deleted; `secretEnvNames` = env vars whose value equals a stored token ≥ 8 chars (warning); e2e uses a DB copy; no schema change, so N+1 → N rollback is safe. |
 | **6. Optional** | `jobs` table replacing JSONL; ssh keys encrypted in the DB (written to a 0600 temp file during sync) | `src/jobPersistence.js` → `src/jobDb.js`, migration 2 | Separate decision (§0 decisions 6 and 7) |
 
 ## 11. Known limits

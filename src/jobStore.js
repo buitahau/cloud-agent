@@ -58,7 +58,7 @@ export const TRANSITIONS = Object.freeze({
  * Internal job record. Field names match the API contract (spec §5) exactly.
  * @typedef {Object} Job
  * @property {string}          id           "job_" + 32 lowercase hex chars (randomUUID without dashes)
- * @property {string}          repo_id      id of the target repo (from REPOS_FILE)
+ * @property {string}          repo_id      id of the target repo (a repo in the database)
  * @property {JobStatus}       status
  * @property {string}          prompt
  * @property {string}          branch       effective branch (payload override, else the repo's defaultBranch) — set at creation

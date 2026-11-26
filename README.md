@@ -24,23 +24,34 @@ claude auth status          # should show "authMethod": "claude.ai"
 
 # 2. Configure
 openssl rand -base64 32           # → MASTER_KEY in .env
-cp .env.example .env              # MASTER_KEY, API_KEY, ADMIN_PASSWORD, one GIT_TOKEN_<NAME> per https repo, ...
-cp repos.example.json repos.json  # the target repos, imported once into the database on first start
+cp .env.example .env              # MASTER_KEY, API_KEY, ADMIN_PASSWORD, ...
+
+# 3. Add repos: in the dashboard (/admin/ → Add repo, see "Admin dashboard"), with the admin API
+#    (see "Managing repos"), or import several at once into the empty database:
+cp repos.example.json repos.json                  # edit it
+read -rs GIT_TOKEN_WEB && export GIT_TOKEN_WEB    # one per auth.tokenEnv in repos.json; in the shell, NOT in .env
+node src/cli.js import repos.json                 # "Imported N repos (...)"
+unset GIT_TOKEN_WEB && rm repos.json              # not read again
 ```
 
 ### Repos (stored in SQLite)
 
 Repos and their tokens live in a SQLite database, `DB_FILE` (default `./data/cloud-agent.db`, created with mode
 0600). Tokens are encrypted with `MASTER_KEY` (see [Master key, backups, rotation](#master-key-backups-rotation)).
-Repos are managed through the admin API (see [Managing repos](#managing-repos-admin-api)); changes apply
-immediately, no restart.
+Repos are managed in the admin dashboard or through the admin API (see [Managing repos](#managing-repos-admin-api));
+changes apply immediately, no restart.
 
-**First-boot import.** The database is filled once from `repos.json` (path set by `REPOS_FILE`, default
-`./repos.json`) plus the `GIT_TOKEN_<NAME>` env vars it names. The import runs only when the repos table is empty,
-the import has never run before, and the file exists. It is atomic (any problem imports nothing and startup fails
-with a list of every problem) and happens once: the log says `Imported N repos from <file>`. After that,
-`repos.json` and `GIT_TOKEN_*` are ignored and only produce a startup warning; remove them. With no database and no
-file, the service starts with 0 repos.
+**Importing a `repos.json`.** `node src/cli.js import <file>` creates the repos described in a JSON file in an
+**empty** database (it refuses otherwise; after that, manage repos in the dashboard or admin API). Each https repo's
+token is read from the env var its `auth.tokenEnv` names, from the shell running the command. The import is atomic:
+any problem imports nothing and lists every problem. Restart the service afterwards so it loads the repos. The file
+is never read again. Docker: see [4. First deploy](#4-first-deploy-and-claude-login). With an empty database the
+service starts with 0 repos.
+
+**Variables the service refuses.** The service never reads `REPOS_FILE`, `GIT_TOKEN` or `GIT_TOKEN_*` (nor the
+single-repo `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR`, `GIT_SSH_KEY_PATH`). While one is set, startup fails with one
+error naming every one to remove from `.env` (or your shell); values are never shown. `node src/cli.js import`
+ignores them. Any other variable holding a stored repo token gets a warning and is hidden from claude and git.
 
 ```json
 {
@@ -55,8 +66,9 @@ file, the service starts with 0 repos.
 
 - `id`: 1–40 chars of `a-z`, `0-9`, `-`. It is the URL segment (`/web/run-agent`) and the workspace folder name.
   `admin`, `health`, `repos`, `run-agent` are reserved.
-- Every remote repo has **its own credential**, with no shared fallback: https URLs need `auth.tokenEnv` (the *name*
-  of an env var holding the token at import time); ssh URLs need `auth.sshKeyPath`, an absolute path inside
+- Every remote repo has **its own credential**, with no shared fallback: https URLs need a token (in the
+  dashboard/API you paste it; in a `repos.json`, `auth.tokenEnv` is the *name* of an env var holding it during the
+  import); ssh URLs need `auth.sshKeyPath`, an absolute path inside
   `SSH_KEYS_DIR` (default `/run/ssh-keys`; for local dev set `SSH_KEYS_DIR=~/.ssh`). Local paths (`/srv/x.git`,
   `file:///...`) take none and are only allowed with `ALLOW_LOCAL_REPOS=true` (tests, local dev). The token is only
   sent to that repo's own host.
@@ -67,20 +79,19 @@ file, the service starts with 0 repos.
   error.
 - Stored repos are re-checked at every startup: an invalid one (e.g. a local repo without `ALLOW_LOCAL_REPOS`) stops
   the service; a missing ssh key file or a missing https token only warns (that repo's jobs fail).
-- To add, edit, disable or delete repos, or to set a token, use the admin API. The first-boot import only fills an
-  empty database.
+- To add, edit, disable or delete repos, or to set a token, use the dashboard or the admin API. The import only
+  fills an empty database.
 
-Migrating from the single-repo version: `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR` and `GIT_SSH_KEY_PATH` are no
-longer read (startup fails if they are set); a leftover `GIT_TOKEN` is ignored with a warning. Move the repo into
-`repos.json` with its token in e.g. `GIT_TOKEN_<NAME>` referenced from `auth.tokenEnv`, and let the first boot
-import it. The old `./workspace` clone is not reused; delete it, since each repo is re-cloned under
-`./workspaces/<id>`.
+Migrating from the single-repo version: `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR`, `GIT_SSH_KEY_PATH` and
+`GIT_TOKEN` are no longer read (startup fails while they are set). Add the repo with its own token in the dashboard
+or admin API (or describe it in a `repos.json` and import it). The old `./workspace` clone is not reused; delete it,
+since each repo is re-cloned under `./workspaces/<id>`.
 
 No Claude token or API key is configured. The service uses the subscription login stored in `~/.claude` of
 the OS user that runs it, so start it as **that same user** (same `HOME`). `ANTHROPIC_API_KEY`,
 `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are stripped from claude's environment, so the machine
 login is always what gets used and billed. The service's own secrets (`API_KEY`, `ADMIN_PASSWORD`,
-`MASTER_KEY`, `MASTER_KEY_PREVIOUS`, every repo's `auth.tokenEnv` variable and any `GIT_TOKEN`/`GIT_TOKEN_*`)
+`MASTER_KEY`, `MASTER_KEY_PREVIOUS`, and any env variable holding a stored repo token (startup warns about it))
 are also removed from the environment of claude and of git; git gets the repo's token only as an origin-scoped
 auth header, and always runs with `GIT_TRACE_REDACT=1`. This is not a sandbox: claude runs as the same OS user
 as the service.
@@ -151,11 +162,13 @@ attached when the container starts:
 |---|---|---|---|
 | `docker-compose.yml` | deploy dir (`/opt/cloud-agent`) | — | CI, on every deploy |
 | `.env` (secrets, incl. `MASTER_KEY`) | deploy dir | env vars | **you**, once |
-| `repos.json` (first-boot import only) | deploy dir (bind mount, read-only) | `/app/repos.json` | **you**, once |
 | Claude login | volume `claude-home` | `/home/node` | **you**, once (`/login`) |
 | repo clones | volume `workspaces` | `/app/workspaces` | the app |
 | job history (`jobs.jsonl`) | volume `data` | `/app/data/jobs.jsonl` | the app |
 | repos + encrypted tokens (`cloud-agent.db`) | volume `data` | `/app/data/cloud-agent.db` | the app |
+| ssh keys (optional) | deploy dir `./ssh` (bind mount, read-only) | `/run/ssh-keys` | **you** |
+
+There is no `repos.json` on the VPS: repos live in the database.
 
 So the same image runs anywhere, secrets never reach the registry, and redeploys keep the login and job history.
 Don't copy your local `jobs.jsonl` or `workspaces/` to the VPS: the app creates its own.
@@ -201,17 +214,17 @@ deploys should wait for approval.
 Copy the compose file and your config into the deploy dir:
 
 ```bash
-scp docker-compose.yml .env repos.json deploy@<vps>:/opt/cloud-agent/
+scp docker-compose.yml .env deploy@<vps>:/opt/cloud-agent/
 ```
 
 Inside the container, paths are container paths, not paths on your laptop. Check these before copying:
 
-- `.env`: `PORT`, `DB_FILE`, `WORKSPACE_ROOT`, `REPOS_FILE` and `JOBS_FILE` are overridden by `docker-compose.yml`,
-  so their values don't matter. Set real values for `MASTER_KEY`, `API_KEY`, `ADMIN_PASSWORD` and every
-  `GIT_TOKEN_<NAME>` (needed for the first-boot import only).
+- `.env`: `PORT`, `DB_FILE`, `WORKSPACE_ROOT` and `JOBS_FILE` are overridden by `docker-compose.yml`, so their
+  values don't matter. Set real values for `MASTER_KEY`, `API_KEY` and `ADMIN_PASSWORD`. Don't put `REPOS_FILE`,
+  `GIT_TOKEN` or `GIT_TOKEN_*` in it: the service refuses to start while one is set.
 - **ssh repos**: put the keys in `/opt/cloud-agent/ssh/` on the VPS, then uncomment the `./ssh:/run/ssh-keys:ro` line
   in `docker-compose.yml` and commit that change, since CI overwrites the VPS copy. Point
-  `"sshKeyPath"` at `/run/ssh-keys/<key>` (keys must be under `/run/ssh-keys`, the default `SSH_KEYS_DIR`). The container runs as uid 1000, so the keys must be readable by it:
+  the repo's `sshKeyPath` at `/run/ssh-keys/<key>` (keys must be under `/run/ssh-keys`, the default `SSH_KEYS_DIR`). The container runs as uid 1000, so the keys must be readable by it:
   ```bash
   sudo chown -R 1000:1000 /opt/cloud-agent/ssh && chmod 600 /opt/cloud-agent/ssh/*
   ```
@@ -240,17 +253,39 @@ echo <PAT> | docker login ghcr.io -u <github-user> --password-stdin
    docker compose logs -f cloud-agent              # expect "Claude auth OK (...)" and "Listening on :8080"
    curl -s localhost:8080/health
    ```
+4. Add repos: open the dashboard (after step 5, or now through `ssh -L 8080:127.0.0.1:8080 deploy@<vps>` →
+   http://localhost:8080/admin/) → Add repo, or `curl` the admin API on the VPS. To import a repos.json once
+   (empty database only):
+   ```bash
+   cd /opt/cloud-agent && chmod 644 repos.json        # no secrets in it; the container runs as uid 1000
+   read -rs GIT_TOKEN_WEB && export GIT_TOKEN_WEB     # one per auth.tokenEnv
+   docker compose run --rm -e GIT_TOKEN_WEB -v "$PWD/repos.json:/tmp/repos.json:ro" cloud-agent node src/cli.js import /tmp/repos.json
+   unset GIT_TOKEN_WEB && rm repos.json
+   docker compose restart cloud-agent                  # loads the imported repos
+   ```
 
-### Upgrading to the SQLite repo store
+### Upgrading from a version that used repos.json
 
-For a VPS that already runs a version reading `repos.json` + `GIT_TOKEN_*` directly:
+CI deploys on merge, and this version refuses to start while `REPOS_FILE`, `GIT_TOKEN` or `GIT_TOKEN_*` is set
+(the error names each). It no longer imports `repos.json` at startup, and compose no longer mounts it. You do not
+need to deploy an intermediate release first.
 
-1. Add `MASTER_KEY` to `/opt/cloud-agent/.env` **before merging to `main`**; otherwise the new container exits with
-   `MASTER_KEY is required` and keeps restarting.
-2. Merge. Check `docker compose logs cloud-agent` for `Imported N repos from /app/repos.json`.
-3. Back up the database (see [Master key, backups, rotation](#master-key-backups-rotation)).
-4. Remove the `GIT_TOKEN_*` lines from `.env` and run `docker compose up -d`. Keep them until you are sure you won't
-   roll back: an older image ignores the database and reads `repos.json` + `GIT_TOKEN_*`.
+**A. The database already has your repos** (an earlier start logged `Imported N repos from /app/repos.json`):
+1. Before merging: back up the database, then remove `REPOS_FILE`, `GIT_TOKEN`, every `GIT_TOKEN_*` and any custom
+   `auth.tokenEnv` variable from `/opt/cloud-agent/.env` (a forgotten custom one only warns).
+2. Merge. Check the log for `Repos: <ids>`. Delete `/opt/cloud-agent/repos.json`.
+
+**B. Coming from the version that read `repos.json` + `GIT_TOKEN_*` directly** (no database yet):
+1. Before merging: add `MASTER_KEY` to `.env` (`openssl rand -base64 32`). Keep `repos.json` and the `GIT_TOKEN_*` lines.
+2. Merge. The new container exits with "`GIT_TOKEN_WEB, REPOS_FILE … are no longer read`" and keeps restarting;
+   the API is down until step 4.
+3. Import (the tokens come from `.env` via compose; the import ignores the retired variables):
+   `docker compose run --rm -v "$PWD/repos.json:/tmp/repos.json:ro" cloud-agent node src/cli.js import /tmp/repos.json`
+4. Back up the database, remove `REPOS_FILE` and the `GIT_TOKEN*` lines from `.env`, run `docker compose up -d`
+   (re-reads `.env`), and check the log for `Repos: <ids>`. Keep a copy of `repos.json` and the tokens (password
+   manager) until you are sure you won't roll back to that version, which reads only `repos.json` + `GIT_TOKEN_*`.
+
+Rolling back to the previous release (the one with the first-boot import) works as is: it reads the same database.
 
 ### 5. Expose it with TLS
 
@@ -275,7 +310,8 @@ Run these in `/opt/cloud-agent` on the VPS:
 | Task | Command |
 |---|---|
 | Deploy a new version | push/merge to `main` (CI does the rest) |
-| Add/change a repo | `curl` the admin API (see [Managing repos](#managing-repos-admin-api)) |
+| Add/change a repo | dashboard (/admin/ → Add repo, or the repo page) or the admin API (see [Managing repos](#managing-repos-admin-api)) |
+| Import repos from a repos.json (empty database only) | see step 4 of [First deploy](#4-first-deploy-and-claude-login) |
 | Back up repos + tokens | `docker compose exec cloud-agent node src/cli.js backup /app/data/backups/$(date +%F).db` (copy it off the VPS; keep `MASTER_KEY` separately) |
 | Rotate `MASTER_KEY` | new key in `MASTER_KEY`, old in `MASTER_KEY_PREVIOUS`, `docker compose up -d`, then remove `MASTER_KEY_PREVIOUS` (see above) |
 | Change `.env` | edit it, then `docker compose up -d` (`restart` does not re-read `.env`) |
@@ -293,8 +329,7 @@ Notes:
 - A deploy or restart stops the service, so jobs that are running at that moment are marked failed.
 - Claude jobs run *inside the container*. Add any toolchain the target repos need (browsers for e2e tests, python,
   ...) to the `Dockerfile`.
-- To test the image locally: `docker compose build && docker compose up` (uses the `.env` and `repos.json` in the
-  repo root).
+- To test the image locally: `docker compose build && docker compose up` (uses the `.env` in the repo root).
 
 ## Admin dashboard
 
@@ -454,10 +489,10 @@ npm test            # unit + integration: fake claude (test-support/fake-claude.
                     # No network, no real claude, no subscription usage.
 
 npm run test:e2e    # = E2E=1 node --test test/e2e.test.js
-                    # Starts the real service with the project's .env and the REAL claude CLI (uses subscription);
-                    # repos.json + GIT_TOKEN_* are imported into a temp DB (MASTER_KEY from .env, or a random one).
+                    # Starts the real service with the project's .env and the REAL claude CLI (uses subscription)
+                    # against a copy of your DB_FILE (decrypted with MASTER_KEY from .env); add the target repo first.
 ```
 
-E2E knobs (env): `E2E_REPO=<id>` (default: first repo in `repos.json`), `E2E_BRANCHES=main,dev`,
+E2E knobs (env): `E2E_REPO=<id>` (default: the first repo in the database), `E2E_BRANCHES=main,dev`,
 `E2E_MARKER_CONTENT=<text>` (T5: push `MARKER.txt` with that content to the repo's `defaultBranch` first), `E2E_T7_EXPECT=<regex>`, `E2E_T8_PROMPT=<prompt that triggers a repo skill/command>`
 and `E2E_T8_EXPECT=<regex>` (T8 is skipped unless `E2E_T8_PROMPT` is set), `E2E_JOB_WAIT_SECONDS=1800`.

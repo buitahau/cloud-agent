@@ -1,13 +1,13 @@
 // Covers: T3, T5, T6, T7, T8 against the REAL claude CLI and a REAL target repo. Opt-in: E2E=1 (npm run test:e2e).
-// Reads the project's .env (dotenv) + REPOS_FILE for the target repo and its token; the service imports repos.json +
-// GIT_TOKEN_* into a temp DB (DB_FILE in a tmp dir; MASTER_KEY from .env or random). Costs subscription usage. T7/T8 assertions are
+// Runs against a copy (VACUUM INTO, via `node src/cli.js backup`) of the project's DB_FILE, decrypted with MASTER_KEY
+// from .env: add the target repo first (dashboard, admin API or node src/cli.js import). Costs subscription usage. T7/T8 assertions are
 // heuristic (result text mentions the agent/skill) — confirm manually via logs_tail as well.
 //
 // How it runs: spawns `node src/index.js` with cwd = project root (so dotenv loads the real .env), PORT=0,
 // then drives it over HTTP exactly like a caller would.
 //
 // Optional knobs (env):
-//   E2E_REPO=<id>                    repo id from REPOS_FILE to test against (default: the first repo)
+//   E2E_REPO=<id>                    repo id in the database (default: the first repo)
 //   E2E_BRANCHES=main,dev            branches for T6 (both must exist on origin)
 //   E2E_MARKER_CONTENT=<text>        T5: expected content of MARKER.txt on the repo's defaultBranch (push it first). If unset,
 //                                    T5 only checks that `commit` equals `git ls-remote` HEAD of that branch.
@@ -18,7 +18,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -34,7 +33,7 @@ let service = null;
 let base = '';
 let apiKey = '';
 let config = null;
-/** @type {import('../src/repoImport.js').ImportRepo|null} */
+/** @type {{ id: string, url: string, defaultBranch: string, sshKeyPath: string|null, token: string|null }|null} */
 let repo = null;
 let serviceLog = '';
 let tmp = '';
@@ -44,23 +43,25 @@ before(async () => {
   const dotenv = await import('dotenv');
   const parsed = dotenv.config({ path: path.join(ROOT, '.env') }).parsed ?? {};
   const env = { ...parsed, ...process.env };
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-'));
-  const serviceEnv = {
-    ...process.env,
-    PORT: '0',
-    DB_FILE: path.join(tmp, 'cloud-agent.db'),
-    MASTER_KEY: env.MASTER_KEY?.trim() || crypto.randomBytes(32).toString('base64'),
-  };
   const { loadConfig } = await import('../src/config.js');
-  const { loadReposFile } = await import('../src/repoImport.js');
-  config = loadConfig({ ...env, ...serviceEnv }, { cwd: ROOT });
+  const { runCli } = await import('../src/cli.js');
+  const { openDb, closeDb } = await import('../src/db.js');
+  const { createRepoStore } = await import('../src/repoStore.js');
+  config = loadConfig(env, { cwd: ROOT }); // fails like the service would (e.g. a leftover GIT_TOKEN_* in .env)
   apiKey = config.apiKey;
-  const f = loadReposFile(config.reposFile, env, { cwd: ROOT, allowLocal: config.allowLocalRepos, sshKeysDir: config.sshKeysDir });
-  if (!f.found || f.problems.length) {
-    throw new Error(`cannot use ${config.reposFile}:\n  - ${f.found ? f.problems.join('\n  - ') : 'file not found'}`);
-  }
-  repo = process.env.E2E_REPO ? f.repos.find((r) => r.id === process.env.E2E_REPO) ?? null : f.repos[0] ?? null;
-  if (!repo) throw new Error(`E2E_REPO "${process.env.E2E_REPO ?? ''}" is not in ${config.reposFile}`);
+  if (!fs.existsSync(config.dbFile)) throw new Error(`no database at ${config.dbFile}: add the target repo first (admin dashboard/API or node src/cli.js import repos.json)`);
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-'));
+  const dbCopy = path.join(tmp, 'cloud-agent.db');
+  const errs = [];
+  if (runCli(['backup', dbCopy], { env: { DB_FILE: config.dbFile }, cwd: ROOT, out: () => {}, err: (m) => errs.push(m) }) !== 0) throw new Error(errs.join('\n'));
+  const db = openDb(dbCopy);
+  try {
+    const store = createRepoStore({ db, keyRing: config.keyRing });
+    const rec = process.env.E2E_REPO ? store.get(process.env.E2E_REPO) : store.list()[0] ?? null;
+    if (!rec) throw new Error(process.env.E2E_REPO ? `E2E_REPO "${process.env.E2E_REPO}" is not in ${config.dbFile}` : `no repos in ${config.dbFile}`);
+    repo = { id: rec.id, url: rec.url, defaultBranch: rec.defaultBranch, sshKeyPath: rec.sshKeyPath, token: store.getToken(rec.id) };
+  } finally { closeDb(db); }
+  const serviceEnv = { ...process.env, PORT: '0', DB_FILE: dbCopy }; // MASTER_KEY etc. come from .env (dotenv, cwd ROOT)
 
   service = spawn(process.execPath, [path.join(ROOT, 'src', 'index.js')], {
     cwd: ROOT,

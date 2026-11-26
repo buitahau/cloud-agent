@@ -8,6 +8,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { isSameOrInside } from './lib/repoValidate.js';
 import { parseKeyRingEnv } from './secrets.js';
+import { SECRET_ENV_PATTERN } from './lib/secretEnv.js';
 
 /** Directory holding this service's code (src/..). */
 const SERVICE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -25,9 +26,6 @@ export const PERMISSION_MODES = Object.freeze([
 /**
  * @typedef {Object} Config
  * @property {string}      dbFile               DB_FILE resolved to an absolute path (default "./data/cloud-agent.db")
- * @property {string}      reposFile            REPOS_FILE resolved to an absolute path (default "./repos.json"); only
- *                                              read once, for the first-boot import into an empty database
- * @property {boolean}     reposFileExplicit    whether REPOS_FILE was set
  * @property {string}      workspaceRoot        WORKSPACE_ROOT (default "./workspaces"), absolute; repos are cloned to <workspaceRoot>/<id>
  * @property {import('./secrets.js').KeyRing} keyRing  from MASTER_KEY (+ MASTER_KEY_PREVIOUS); never holds raw key strings
  * @property {boolean}     allowLocalRepos      ALLOW_LOCAL_REPOS (default false): allow absolute-path / file:// repos
@@ -60,18 +58,33 @@ export class ConfigError extends Error {
   }
 }
 
-/** Env vars from the single-repo version; setting any of them is a mistake now. */
-const LEGACY_VARS = Object.freeze(['REPO_URL', 'REPO_BRANCH', 'WORKSPACE_DIR', 'GIT_SSH_KEY_PATH']);
+/** Env vars that are no longer read (single-repo era, repos.json era). Setting one fails startup. */
+const RETIRED_VARS = Object.freeze(['REPO_URL', 'REPO_BRANCH', 'WORKSPACE_DIR', 'GIT_SSH_KEY_PATH', 'REPOS_FILE', 'GIT_TOKEN']);
+
+/** @param {string} name @returns {boolean} REPOS_FILE / GIT_TOKEN / GIT_TOKEN_*: read only by `node src/cli.js import`. */
+export function isRepoImportVar(name) {
+  return name === 'REPOS_FILE' || name === 'GIT_TOKEN' || SECRET_ENV_PATTERN.test(name);
+}
+
+/**
+ * Copy of env without the repos.json-era vars (for `node src/cli.js import`, which reads token vars itself).
+ * @param {Record<string, string|undefined>} env
+ * @returns {Record<string, string|undefined>}
+ */
+export function withoutRepoImportVars(env) {
+  return Object.fromEntries(Object.entries(env).filter(([k]) => !isRepoImportVar(k)));
+}
 
 /**
  * Build and validate the config from an env-like object. Env only: never reads files (repos live in the
- * database, see src/repoStore.js; REPOS_FILE is only imported once, by src/repoImport.js).
+ * database, see src/repoStore.js).
  *
  * Rules:
  *  - Treat empty strings / whitespace-only env values as "unset". Trim all values.
  *  - Required: API_KEY and MASTER_KEY (base64 of 32 bytes).
  *  - Integers: parse with Number(); must be Number.isInteger and within range, else problem.
  *  - Never put secret values (API key, admin password, master keys) into error messages.
+ *  - Retired vars (RETIRED_VARS, GIT_TOKEN_*) set to a non-blank value -> one problem naming all of them.
  *  - Return Object.freeze()d Config.
  *
  * @param {Record<string, string|undefined>} env  usually process.env
@@ -112,9 +125,15 @@ export function loadConfig(env, opts = {}) {
   const apiKey = get('API_KEY');
   if (apiKey === null) problems.push('API_KEY is required');
 
-  const legacy = LEGACY_VARS.filter((k) => get(k) !== null);
-  if (legacy.length) {
-    problems.unshift(`${legacy.join(', ')} ${legacy.length > 1 ? 'are' : 'is'} no longer supported; repos are stored in the database (imported once from REPOS_FILE, see repos.example.json)`);
+  // Values never appear in the message (GIT_TOKEN* hold secrets).
+  const retired = Object.keys(env)
+    .filter((k) => (RETIRED_VARS.includes(k) || SECRET_ENV_PATTERN.test(k)) && get(k) !== null)
+    .sort();
+  if (retired.length) {
+    const many = retired.length > 1;
+    problems.unshift(`${retired.join(', ')} ${many ? 'are' : 'is'} no longer read: repos and their tokens are stored in the database (DB_FILE). `
+      + `Remove ${many ? 'them' : 'it'} from .env (or the environment)${retired.includes('REPOS_FILE') ? ' and the repos.json mount from docker-compose.yml' : ''}; `
+      + 'add repos in the admin dashboard or API, or import a repos.json into an empty database with: node src/cli.js import <file>');
   }
 
   const claudePermissionMode = get('CLAUDE_PERMISSION_MODE') ?? 'bypassPermissions';
@@ -141,8 +160,6 @@ export function loadConfig(env, opts = {}) {
     if (apiKey !== null && adminPassword === apiKey) problems.push('ADMIN_PASSWORD must differ from API_KEY');
   }
 
-  const reposFileRaw = get('REPOS_FILE');
-  const reposFile = path.resolve(cwd, reposFileRaw ?? './repos.json');
   const dbFile = path.resolve(cwd, get('DB_FILE') ?? './data/cloud-agent.db');
   const workspaceRoot = path.resolve(cwd, get('WORKSPACE_ROOT') ?? './workspaces');
   // git clean -fdx inside a workspace that contains the service would delete the service.
@@ -167,8 +184,6 @@ export function loadConfig(env, opts = {}) {
 
   return Object.freeze({
     dbFile,
-    reposFile,
-    reposFileExplicit: reposFileRaw !== null,
     workspaceRoot,
     keyRing: /** @type {import('./secrets.js').KeyRing} */ (keyRing),
     allowLocalRepos,

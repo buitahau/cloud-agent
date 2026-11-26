@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadConfig, ConfigError, expandHome, redactConfig } from '../src/config.js';
+import { loadConfig, ConfigError, expandHome, redactConfig, withoutRepoImportVars } from '../src/config.js';
 import { deriveKeyId } from '../src/secrets.js';
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-'));
@@ -43,8 +43,7 @@ test('minimal valid env (API_KEY + MASTER_KEY) -> defaults applied', () => {
   assert.equal(c.adminPassword, null);
   assert.equal(c.dbFile, path.join(cwd, 'data', 'cloud-agent.db'));
   assert.equal(c.workspaceRoot, path.join(cwd, 'workspaces'));
-  assert.equal(c.reposFile, path.join(cwd, 'repos.json'));
-  assert.equal(c.reposFileExplicit, false);
+  assert.ok(!('reposFile' in c) && !('reposFileExplicit' in c));
   assert.equal(c.allowLocalRepos, false);
   assert.equal(c.trustProxy, false);
   assert.equal(c.sshKeysDir, '/run/ssh-keys');
@@ -93,22 +92,31 @@ test('DB_FILE resolved against cwd and may not live inside WORKSPACE_ROOT', () =
   assert.equal(loadConfig({ ...BASE, DB_FILE: './d/x.db' }, { cwd }).dbFile, path.join(cwd, 'd', 'x.db'));
 });
 
-test('ALLOW_LOCAL_REPOS, SSH_KEYS_DIR, REPOS_FILE', () => {
+test('ALLOW_LOCAL_REPOS, SSH_KEYS_DIR, TRUST_PROXY', () => {
   assert.equal(loadConfig({ ...BASE, ALLOW_LOCAL_REPOS: 'yes' }, { cwd }).allowLocalRepos, true);
   assert.match(problemsOf({ ...BASE, ALLOW_LOCAL_REPOS: 'maybe' })[0], /ALLOW_LOCAL_REPOS/);
   assert.equal(loadConfig({ ...BASE, TRUST_PROXY: 'yes' }, { cwd }).trustProxy, true);
   assert.throws(() => loadConfig({ ...BASE, TRUST_PROXY: 'maybe' }, { cwd }), (e) => e instanceof ConfigError && /TRUST_PROXY/.test(e.message));
   assert.equal(loadConfig({ ...BASE, SSH_KEYS_DIR: '~/keys' }, { cwd }).sshKeysDir, path.join(os.homedir(), 'keys'));
-  const c = loadConfig({ ...BASE, REPOS_FILE: 'missing.json' }, { cwd });
-  assert.equal(c.reposFile, path.join(cwd, 'missing.json'));
-  assert.equal(c.reposFileExplicit, true);
 });
 
-test('old single-repo env vars are rejected with a pointer to the database; GIT_TOKEN alone loads', () => {
-  const problems = problemsOf({ ...BASE, REPO_URL: '/x.git', GIT_SSH_KEY_PATH: '/k' });
+test('retired env vars (single-repo and repos.json era) -> one problem naming each, sorted; values never shown', () => {
+  const problems = problemsOf({ ...BASE, REPO_URL: '/x.git', GIT_SSH_KEY_PATH: '/k', REPOS_FILE: './repos.json',
+    GIT_TOKEN: 'ghp_old_secret', GIT_TOKEN_WEB: 'ghp_web_secret', MY_PAT: 'x' });
   assert.equal(problems.length, 1);
-  assert.match(problems[0], /REPO_URL, GIT_SSH_KEY_PATH are no longer supported; repos are stored in the database/);
-  assert.equal(loadConfig({ ...BASE, GIT_TOKEN: 'ghp_old' }, { cwd }).apiKey, 'k');
+  assert.match(problems[0], /^GIT_SSH_KEY_PATH, GIT_TOKEN, GIT_TOKEN_WEB, REPOS_FILE, REPO_URL are no longer read: repos and their tokens are stored in the database \(DB_FILE\)/);
+  assert.match(problems[0], /repos\.json mount from docker-compose\.yml/);
+  assert.match(problems[0], /node src\/cli\.js import <file>/);
+  assert.doesNotMatch(problems[0], /MY_PAT|ghp_/);
+  const one = problemsOf({ ...BASE, GIT_TOKEN_A: 'x' })[0];
+  assert.match(one, /^GIT_TOKEN_A is no longer read: .*Remove it from \.env/);
+  assert.doesNotMatch(one, /mount/);
+  assert.equal(loadConfig({ ...BASE, REPOS_FILE: '', GIT_TOKEN_X: '  ' }, { cwd }).apiKey, 'k'); // blank = unset
+});
+
+test('withoutRepoImportVars drops REPOS_FILE / GIT_TOKEN / GIT_TOKEN_* only', () => {
+  const env = withoutRepoImportVars({ ...BASE, REPOS_FILE: 'r', GIT_TOKEN: 'a', GIT_TOKEN_B: 'b', REPO_URL: '/x', KEEP: '1' });
+  assert.deepEqual(Object.keys(env).sort(), ['API_KEY', 'KEEP', 'MASTER_KEY', 'REPO_URL']);
 });
 
 test('MAX_CONCURRENT_JOBS, JOBS_FILE, JOB_RETENTION_MAX, ADMIN_* parsed and checked', () => {

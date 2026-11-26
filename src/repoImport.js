@@ -1,18 +1,18 @@
 // src/repoImport.js
-// One-time import of REPOS_FILE (repos.json) + the GIT_TOKEN_* env vars it names into the repo database, on a
-// first boot with an empty database. All or nothing (one transaction). Never puts token values in messages.
+// `node src/cli.js import <file>`: import a repos.json + the token env vars it names into an EMPTY repo database.
+// All or nothing (one transaction). Never puts token values in messages. The service itself never reads repos.json.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { expandHome } from './config.js';
 import { validateRepoInput, validateToken } from './lib/repoValidate.js';
 
-/** meta key set once the import ran (even for 0 repos); the import never runs again after that. */
+/** meta key set (refreshed) by every import, even of 0 repos; informational only. */
 export const META_IMPORTED = 'imported_from_repos_json_at';
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** Thrown when REPOS_FILE exists but cannot be imported. Nothing was written. */
+/** Thrown when a repos file cannot be imported. Nothing was written. */
 export class ImportError extends Error {
   /** @param {string[]} problems */
   constructor(problems) {
@@ -53,34 +53,34 @@ export function loadReposFile(file, env, { cwd, allowLocal, sshKeysDir }) {
   try {
     raw = fs.readFileSync(file, 'utf8');
   } catch (err) {
-    // EISDIR: docker creates a directory when the mounted ./repos.json does not exist on the host.
+    // EISDIR: a directory at that path (Docker creates one for a missing bind-mount source).
     if (err?.code === 'ENOENT' || err?.code === 'EISDIR') return { ...out, found: false };
-    problems.push(`REPOS_FILE could not be read: ${file} (${err?.code ?? err?.message})`);
+    problems.push(`could not read ${file} (${err?.code ?? err?.message})`);
     return out;
   }
   let doc;
   try {
     doc = JSON.parse(raw);
   } catch (err) {
-    problems.push(`REPOS_FILE is not valid JSON: ${err.message}`);
+    problems.push(`${file} is not valid JSON: ${err.message}`);
     return out;
   }
   if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    problems.push('REPOS_FILE must contain a JSON object with a "repos" array');
+    problems.push(`${file} must contain a JSON object with a "repos" array`);
     return out;
   }
   if (typeof doc.workspaceRoot === 'string' && doc.workspaceRoot.trim()) {
     out.workspaceRoot = path.resolve(cwd, doc.workspaceRoot.trim());
   }
   if (!Array.isArray(doc.repos)) {
-    problems.push('REPOS_FILE: "repos" must be an array');
+    problems.push(`${file}: "repos" must be an array`);
     return out;
   }
 
   const seen = new Set();
   const names = new Set();
   doc.repos.forEach((r, i) => {
-    const where = `REPOS_FILE repos[${i}]`;
+    const where = `repos[${i}]`;
     if (r === null || typeof r !== 'object' || Array.isArray(r)) {
       problems.push(`${where} must be an object`);
       return;
@@ -134,64 +134,33 @@ export function loadReposFile(file, env, { cwd, allowLocal, sshKeysDir }) {
 }
 
 /**
- * Best-effort list of the auth.tokenEnv names in a repos file (so they are stripped from child envs and
- * flagged as leftovers even when the import is skipped). Never throws.
- * @param {string} file
- * @returns {string[]}
+ * Import a repos file into an EMPTY database, atomically. Used by `node src/cli.js import <file>`.
+ * @param {{ store: import('./repoStore.js').RepoStore, file: string,
+ *           config: Pick<import('./config.js').Config, 'workspaceRoot'|'allowLocalRepos'|'sshKeysDir'>,
+ *           env: Record<string, string|undefined>, cwd?: string, log: { warn: (m: string) => void } }} opts
+ * @returns {{ count: number, ids: string[] }}
+ * @throws {ImportError} database not empty, file missing/invalid, token variable unset/invalid (nothing written)
  */
-export function collectTokenEnvNames(file) {
-  try {
-    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!Array.isArray(doc?.repos)) return [];
-    const names = new Set();
-    for (const r of doc.repos) {
-      const n = r?.auth?.tokenEnv;
-      if (typeof n === 'string' && ENV_NAME_RE.test(n)) names.add(n);
-    }
-    return [...names];
-  } catch {
-    return [];
-  }
-}
-
-/**
- * First-boot import: only when the repos table is empty AND the import never ran AND REPOS_FILE exists.
- * Atomic: any invalid repo or a failing write imports nothing.
- * @param {{ store: import('./repoStore.js').RepoStore, config: Pick<import('./config.js').Config, 'reposFile'|'workspaceRoot'|'allowLocalRepos'|'sshKeysDir'>,
- *           env: Record<string, string|undefined>, cwd?: string, log: { info: (m: string) => void, warn: (m: string) => void } }} opts
- * @returns {{ status: 'imported', count: number, ids: string[], tokenEnvNames: string[] }
- *         | { status: 'skipped', reason: 'db-not-empty'|'already-imported'|'no-file', tokenEnvNames: string[] }}
- * @throws {ImportError}
- */
-export function importReposJson({ store, config, env, cwd = process.cwd(), log }) {
-  if (store.count() > 0) {
-    return { status: 'skipped', reason: 'db-not-empty', tokenEnvNames: collectTokenEnvNames(config.reposFile) };
-  }
-  if (store.getMeta(META_IMPORTED) !== null) {
-    return { status: 'skipped', reason: 'already-imported', tokenEnvNames: collectTokenEnvNames(config.reposFile) };
-  }
-  const parsed = loadReposFile(config.reposFile, env, { cwd, allowLocal: config.allowLocalRepos, sshKeysDir: config.sshKeysDir });
-  if (!parsed.found) {
-    log.info(`No repos in the database and REPOS_FILE not found (${config.reposFile}); starting with 0 repos`);
-    return { status: 'skipped', reason: 'no-file', tokenEnvNames: [] };
-  }
+export function importReposFile({ store, file, config, env, cwd = process.cwd(), log }) {
+  const notEmpty = (n) => new ImportError([`the database already has ${n} repo${n === 1 ? '' : 's'}; import only fills an empty database (manage repos in the admin dashboard or API)`]);
+  const existing = store.count();
+  if (existing > 0) throw notEmpty(existing);
+  const parsed = loadReposFile(file, env, { cwd, allowLocal: config.allowLocalRepos, sshKeysDir: config.sshKeysDir });
+  if (!parsed.found) throw new ImportError([`${file} not found`]);
   if (parsed.problems.length) throw new ImportError(parsed.problems);
   if (parsed.workspaceRoot && parsed.workspaceRoot !== config.workspaceRoot) {
     log.warn(`WARNING: repos.json workspaceRoot (${parsed.workspaceRoot}) is ignored; workspaces live in WORKSPACE_ROOT (${config.workspaceRoot}). Set WORKSPACE_ROOT=${parsed.workspaceRoot} to keep the existing clones.`);
   }
-  const done = store.tx(() => {
-    if (store.count() > 0 || store.getMeta(META_IMPORTED) !== null) return false; // re-check under the write lock
+  store.tx(() => {
+    const n = store.count();
+    if (n > 0) throw notEmpty(n); // re-check under the write lock (a repo was added through the admin API meanwhile); tx rolls back
     const summary = parsed.repos.map((r) => {
       store.insertRepo(r);
       const t = r.token ? store.setToken(r.id, r.token) : null;
       return { id: r.id, kind: r.kind, token: t ? (t.hint ? `set …${t.hint}` : 'set') : null };
     });
     store.setMeta(META_IMPORTED, new Date().toISOString());
-    store.insertAudit({ actor: 'system', action: 'import', details: { file: config.reposFile, count: summary.length, repos: summary } });
-    return true;
+    store.insertAudit({ actor: 'cli', action: 'import', details: { file, count: summary.length, repos: summary } });
   });
-  if (!done) return { status: 'skipped', reason: 'db-not-empty', tokenEnvNames: parsed.tokenEnvNames };
-  const n = parsed.repos.length;
-  log.info(`Imported ${n} repo${n === 1 ? '' : 's'} from ${config.reposFile}; you can now remove REPOS_FILE, the repos.json mount and GIT_TOKEN_* from .env`);
-  return { status: 'imported', count: n, ids: parsed.repos.map((r) => r.id), tokenEnvNames: parsed.tokenEnvNames };
+  return { count: parsed.repos.length, ids: parsed.repos.map((r) => r.id) };
 }
