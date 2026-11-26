@@ -70,7 +70,11 @@ test('probe:false skips the -p call (FAKE_CLAUDE_RECORD has no -p entry)', () =>
 test('probe runs in os.tmpdir() with token/API-key env vars stripped (uses machine login)', () => withRecord(async (rec, read) => {
   await checkClaudeAuth({
     claudeBin: FAKE_CLAUDE, probe: true,
-    baseEnv: { ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'strip-me', CLAUDE_CODE_OAUTH_TOKEN: 'strip-me-too' },
+    baseEnv: {
+      ...process.env, FAKE_CLAUDE_RECORD: rec, ANTHROPIC_API_KEY: 'strip-me', CLAUDE_CODE_OAUTH_TOKEN: 'strip-me-too',
+      API_KEY: 'k', ADMIN_PASSWORD: 'p', MY_PAT: 'x',
+    },
+    secretEnvNames: ['MY_PAT'],
   });
   const probe = read().find((e) => e.argv.includes('-p'));
   assert.ok(probe);
@@ -79,6 +83,9 @@ test('probe runs in os.tmpdir() with token/API-key env vars stripped (uses machi
   assert.equal(probe.stdin, 'Reply with exactly: OK');
   assert.equal(probe.env.CLAUDE_CODE_OAUTH_TOKEN, null);
   assert.equal(probe.env.ANTHROPIC_API_KEY, null);
+  for (const e of read()) {
+    for (const k of ['API_KEY', 'ADMIN_PASSWORD', 'MY_PAT']) assert.ok(!e.envKeys.includes(k), `${k} reached claude`);
+  }
 }));
 
 test('stub run: unparseable auth status -> step "status"; probe exit 0 but is_error -> step "probe"', async () => {

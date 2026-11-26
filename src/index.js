@@ -21,15 +21,16 @@ import { createApp, startServer } from './server.js';
  *     console.log('Config:', JSON.stringify(redactConfig(config)))
  *  2. if process.getuid?.() === 0 && config.claudePermissionMode === 'bypassPermissions':
  *       console.warn — claude refuses bypassPermissions as root; run as a non-root user.
- *  3. auth = await checkClaudeAuth({ claudeBin, probe: config.claudeAuthProbe })
+ *     secretEnvNames = config.repos' tokenEnv names (hidden from claude and git; process.env is not modified)
+ *  3. auth = await checkClaudeAuth({ claudeBin, probe: config.claudeAuthProbe, secretEnvNames })
  *       ClaudeAuthError -> console.error(err.message); process.exit(1)
  *     console.log(`Claude auth OK (${auth.authMethod}, ${auth.version}${auth.probed ? ', probe passed' : ', probe skipped'})`)
  *  4. persistence = JOBS_FILE ? createJobPersistence(...) : null
  *     store  = createJobStore({ logsTailLines, retentionMax: jobRetentionMax, onPersist: persistence?.append })
  *     if persistence: store.hydrate(persistence.load()); persistence.compact(...)
  *       console.log(`Jobs file: <file> (<n> jobs loaded, <m> interrupted)`)
- *     repos  = createRepoRegistry(config.repos, { gitTimeoutMs })   (one GitSync per repo)
- *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs })   (shared)
+ *     repos  = createRepoRegistry(config.repos, { gitTimeoutMs, secretEnvNames })   (one GitSync per repo)
+ *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs, secretEnvNames })   (shared)
  *     worker = createWorker({ store, repos, claudeRunner: runner, maxConcurrent: maxConcurrentJobs })
  *     app    = createApp({ config, store, worker, repos, adminRouter? })   (admin only if ADMIN_PASSWORD is set)
  *     console.log(`Repos: <id>, <id>`) and `Admin dashboard: /admin/` or `Admin dashboard: disabled ...`
@@ -62,6 +63,8 @@ export async function main() {
     throw err;
   }
   console.log('Config:', JSON.stringify(redactConfig(config)));
+  // Repo tokens are read by config; no child process (claude, git) needs the raw variables.
+  const secretEnvNames = config.repos.map((r) => r.tokenEnv).filter(Boolean);
 
   // 2. root warning
   if (process.getuid?.() === 0 && config.claudePermissionMode === 'bypassPermissions') {
@@ -74,6 +77,7 @@ export async function main() {
     auth = await checkClaudeAuth({
       claudeBin: config.claudeBin,
       probe: config.claudeAuthProbe,
+      secretEnvNames,
     });
   } catch (err) {
     if (err instanceof ClaudeAuthError) {
@@ -106,12 +110,13 @@ export async function main() {
     persistence.compact(store.list().map((j) => store.snapshot(j)));
     console.log(`Jobs file: ${config.jobsFile} (${loaded} jobs loaded, ${interrupted} interrupted)`);
   }
-  const repos = createRepoRegistry(config.repos, { gitTimeoutMs: config.gitTimeoutMs });
+  const repos = createRepoRegistry(config.repos, { gitTimeoutMs: config.gitTimeoutMs, secretEnvNames });
   const runner = createClaudeRunner({
     claudeBin: config.claudeBin,
     permissionMode: config.claudePermissionMode,
     maxTurns: config.claudeMaxTurns,
     timeoutMs: config.jobTimeoutMs,
+    secretEnvNames,
   });
   const worker = createWorker({ store, repos, claudeRunner: runner, maxConcurrent: config.maxConcurrentJobs });
   const adminRouter = config.adminPassword

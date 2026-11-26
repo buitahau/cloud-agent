@@ -158,7 +158,7 @@ test('log callback receives "[git] $ git ..." lines', async () => {
 test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+token -> GIT_CONFIG_* header; token never in argv', async () => {
   const base = { PATH: '/bin' };
   const plain = buildGitEnv({ baseEnv: base, repoUrl: 'git@github.com:o/r.git' });
-  assert.deepEqual(plain, { PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'https:ssh:file' });
+  assert.deepEqual(plain, { PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'https:ssh:file', GIT_TRACE_REDACT: '1' });
   assert.deepEqual(base, { PATH: '/bin' });
 
   const ssh = buildGitEnv({ baseEnv: base, repoUrl: 'git@github.com:o/r.git', sshKeyPath: '/home/u/.ssh/id', token: 'tok' });
@@ -177,13 +177,35 @@ test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+toke
     calls.push(o);
     return { code: 1, signal: null, stdout: '', stderr: 'fatal: nope\n', timedOut: false, aborted: false, truncated: false, spawnError: null, durationMs: 1 };
   };
-  const gs = createGitSync({ repoUrl: 'https://github.com/o/r.git', token: 'ghp_secret', workspaceDir: '/tmp/cloud-agent-never-exists-xyz/ws', timeoutMs: 1000, run: stub });
+  const gs = createGitSync({
+    repoUrl: 'https://github.com/o/r.git', token: 'ghp_secret', workspaceDir: '/tmp/cloud-agent-never-exists-xyz/ws', timeoutMs: 1000, run: stub,
+    baseEnv: { PATH: '/bin', API_KEY: 'k', MY_PAT: 'x' }, secretEnvNames: ['MY_PAT'],
+  });
   await assert.rejects(gs.sync('main'), /git clone failed: fatal: nope/);
   assert.equal(calls.length, 1);
   assert.ok(!calls[0].args.join(' ').includes('ghp_secret'));
   assert.equal(calls[0].env.GIT_TERMINAL_PROMPT, '0');
   assert.ok(calls[0].env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic '));
+  assert.equal(calls[0].env.API_KEY, undefined);
+  assert.equal(calls[0].env.MY_PAT, undefined);
+  assert.equal(calls[0].env.GIT_TRACE_REDACT, '1');
   fs.rmSync('/tmp/cloud-agent-never-exists-xyz', { recursive: true, force: true });
+});
+
+test("buildGitEnv strips service secrets, keeps the repo's own header, forces GIT_TRACE_REDACT", () => {
+  const base = {
+    PATH: '/bin', API_KEY: 'k', ADMIN_PASSWORD: 'p', MASTER_KEY: 'm', MASTER_KEY_PREVIOUS: 'mp', GIT_TOKEN_WEB: 'w',
+    MY_PAT: 'ghp_secret', GIT_TRACE_REDACT: '0', GIT_AUTHOR_NAME: 'a',
+  };
+  const snapshot = { ...base };
+  const env = buildGitEnv({ baseEnv: base, repoUrl: 'https://github.com/o/r.git', token: 'ghp_secret', secretEnvNames: ['MY_PAT'] });
+  for (const k of ['API_KEY', 'ADMIN_PASSWORD', 'MASTER_KEY', 'MASTER_KEY_PREVIOUS', 'GIT_TOKEN_WEB', 'MY_PAT']) {
+    assert.equal(k in env, false, `${k} reached git`);
+  }
+  assert.equal(env.GIT_TRACE_REDACT, '1');
+  assert.equal(env.GIT_AUTHOR_NAME, 'a');
+  assert.ok(env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic '));
+  assert.deepEqual(base, snapshot);
 });
 
 test('two repos synced into two workspaces stay independent', async () => {

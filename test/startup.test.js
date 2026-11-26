@@ -14,7 +14,7 @@ const INDEX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src
 function cleanEnv(extra) {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (/^(REPO_|REPOS_FILE|WORKSPACE_DIR|GIT_|CLAUDE|ANTHROPIC_|API_KEY|PORT|JOB_|LOGS_TAIL|FAKE_CLAUDE|MAX_CONCURRENT|ADMIN_)/.test(k)) delete env[k];
+    if (/^(REPO_|REPOS_FILE|WORKSPACE_DIR|GIT_|CLAUDE|ANTHROPIC_|API_KEY|PORT|JOB_|LOGS_TAIL|FAKE_CLAUDE|MAX_CONCURRENT|ADMIN_|MASTER_KEY)/.test(k)) delete env[k];
   }
   return { ...env, ...extra };
 }
@@ -179,5 +179,29 @@ test('CLAUDE_AUTH_PROBE=false -> starts with "probe skipped" even with an invali
     s.child.kill('SIGINT');
     const { code } = await s.withTimeout(10_000);
     assert.equal(code, 0);
+  } finally { s.child.kill('SIGKILL'); s.cleanup(); }
+});
+
+test('claude never sees API_KEY, ADMIN_PASSWORD, MASTER_KEY or repo tokens', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-'));
+  const rec = path.join(cwd, 'rec.jsonl');
+  const repos = [{ id: 'web', url: 'https://example.invalid/o/r.git', auth: { tokenEnv: 'MY_REPO_PAT' } }];
+  const s = startService({
+    ADMIN_PASSWORD: 'admin-secret-pw', MASTER_KEY: 'mk', MASTER_KEY_PREVIOUS: 'mkp', MY_REPO_PAT: 'pat-secret',
+    GIT_TOKEN_OLD: 'old', FAKE_CLAUDE_RECORD: rec,
+  }, { cwd, repos });
+  try {
+    await s.waitFor(/Claude auth OK/);
+    await s.waitFor(/Listening on :\d+/);   // signal handlers are installed by then
+    const entries = fs.readFileSync(rec, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.ok(entries.length >= 2, `expected auth status + probe records, got ${entries.length}`);
+    for (const e of entries) {
+      for (const k of ['API_KEY', 'ADMIN_PASSWORD', 'MASTER_KEY', 'MASTER_KEY_PREVIOUS', 'MY_REPO_PAT', 'GIT_TOKEN_OLD']) {
+        assert.ok(!e.envKeys.includes(k), `${k} reached claude (${e.argv.join(' ')})`);
+      }
+    }
+    assert.ok(!s.out().includes('pat-secret'), 'repo token leaked into logs');
+    s.child.kill('SIGTERM');
+    assert.equal((await s.withTimeout(10_000)).code, 0);
   } finally { s.child.kill('SIGKILL'); s.cleanup(); }
 });
