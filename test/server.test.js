@@ -1,13 +1,22 @@
 // Covers: T2 (202 + id, fast, non-blocking), T4 (404), x-api-key auth, body validation, error shapes,
-// per-repo routing (/<repo>/run-agent), job listing, and the admin dashboard API (Basic auth).
+// per-repo routing (/<repo>/run-agent), job listing, the admin dashboard API (Basic auth), and the admin write API
+// (CSRF checks, TRUST_PROXY, repo create/update/token/delete, disabled repos, audit log).
 // Start with startServer(createApp(...), 0) and use global fetch. Stub worker = { enqueue: id => calls.push(id) }.
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import express from 'express';
 import { createApp, startServer, apiKeyAuth } from '../src/server.js';
 import { createJobStore } from '../src/jobStore.js';
 import { createRepoRegistry } from '../src/repoRegistry.js';
 import { createAdminRouter } from '../src/admin.js';
+import { openDb, closeDb } from '../src/db.js';
+import { migrate } from '../src/db/migrations.js';
+import { createKeyRing } from '../src/secrets.js';
+import { createRepoStore } from '../src/repoStore.js';
 
 const KEY = 'test-key';
 const silent = { info() {}, warn() {}, error() {} };
@@ -17,7 +26,7 @@ const REPOS = [
   { id: 'api', url: '/srv/api.git', kind: 'local', defaultBranch: 'main', sshKeyPath: null, enabled: true },
 ];
 const repos = () => createRepoRegistry({
-  repoStore: { list: () => REPOS, getToken: () => null }, workspaceRoot: '/tmp/cloud-agent-test-nonexistent', gitTimeoutMs: 1000,
+  repoStore: { list: () => REPOS, getToken: () => null, tokenInfo: () => null }, workspaceRoot: '/tmp/cloud-agent-test-nonexistent', gitTimeoutMs: 1000,
 });
 const appFor = (store, extra = {}) => createApp({ config: { apiKey: KEY }, store, worker: { enqueue() {} }, repos: repos(), logger: silent, ...extra });
 
@@ -385,7 +394,7 @@ const ADMIN_FIXTURE = new URL('../test-support/admin-fixture/', import.meta.url)
 async function withAdmin(fn, { publicDir = ADMIN_FIXTURE } = {}) {
   const store = createJobStore();
   const registry = repos();
-  const worker = { enqueue() {}, stats: () => ({ maxConcurrent: 2, queued: 0, running: [] }), queueLength: () => 0 };
+  const worker = { enqueue() {}, stats: () => ({ maxConcurrent: 2, queued: 0, running: [] }), queueLength: () => 0, poke() {} };
   const adminRouter = createAdminRouter({ config: ADMIN, store, worker, repos: registry, persistence: true, publicDir });
   const app = createApp({ config: { apiKey: KEY }, store, worker, repos: registry, logger: silent, adminRouter });
   const server = await startServer(app, 0, '127.0.0.1');
@@ -495,6 +504,8 @@ test('admin: summary, repos (health from job history), repo detail, jobs list, j
     assert.equal(web.last_sync.ok, true);
     assert.equal(web.cloned, false);
     assert.equal(web.counts.succeeded, 1);
+    assert.equal(web.enabled, true);
+    assert.deepEqual(web.auth, { kind: 'local', token: null, ssh_key_path: null });
     assert.equal(api.health, 'sync_error');
     assert.equal(api.last_sync.error, 'git fetch failed: no such branch');
     assert.equal(api.last_job.id, bad.id);
@@ -510,7 +521,10 @@ test('admin: summary, repos (health from job history), repo detail, jobs list, j
     assert.deepEqual(jobs.jobs.map((j) => j.id), [ok.id]);
     jobs = await (await get(base, '/admin/api/jobs?status=failed', AUTH)).json();
     assert.deepEqual(jobs.jobs.map((j) => j.id), [bad.id]);
-    assert.equal((await get(base, '/admin/api/jobs?repo=nope', AUTH)).status, 400);
+    const nope = await get(base, '/admin/api/jobs?repo=nope', AUTH); // any valid id (deleted repos' history)
+    assert.equal(nope.status, 200);
+    assert.deepEqual(await nope.json(), { jobs: [], next: null });
+    assert.equal((await get(base, '/admin/api/jobs?repo=Bad_Id', AUTH)).status, 400);
     assert.equal((await get(base, '/admin/api/jobs?limit=999', AUTH)).status, 400);
 
     const detail = await (await get(base, `/admin/api/jobs/${ok.id}`, AUTH)).json();
@@ -546,4 +560,236 @@ test('admin: dashboard never injects raw HTML (untrusted job text is rendered as
     const code = src.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
     assert.ok(!/dangerouslySetInnerHTML|innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(code), f);
   }
+});
+
+// ---- admin write API (/admin/api/repos, /admin/api/audit) ---------------------------------------------------
+
+const W = { 'content-type': 'application/json', 'x-admin-request': '1' };
+const send = (base, method, p, body, headers = { ...AUTH, ...W }) =>
+  fetch(`${base}${p}`, { method, headers, body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)) });
+const LOCAL = { id: 'loc', url: '/srv/loc.git' };
+const HTTPS_TOKEN = 'ghp_server_secret_1234';
+
+const wtmp = fs.mkdtempSync(path.join(os.tmpdir(), 'admin-w-'));
+after(() => fs.rmSync(wtmp, { recursive: true, force: true }));
+
+async function withAdminDb(fn, { trustProxy = false } = {}) {
+  const db = openDb(':memory:');
+  migrate(db);
+  const repoStore = createRepoStore({ db, keyRing: createKeyRing(crypto.randomBytes(32)) });
+  const store = createJobStore();
+  const workspaceRoot = fs.mkdtempSync(path.join(wtmp, 'ws-'));
+  const registry = createRepoRegistry({
+    repoStore, jobs: store, workspaceRoot, gitTimeoutMs: 1000, allowLocal: true, sshKeysDir: wtmp, log: silent,
+  });
+  let pokes = 0;
+  const worker = {
+    enqueue() {}, stats: () => ({ maxConcurrent: 1, queued: 0, running: [] }), queueLength: () => 0, poke: () => { pokes++; },
+  };
+  const adminRouter = createAdminRouter({ config: { ...ADMIN, trustProxy }, store, worker, repos: registry, publicDir: ADMIN_FIXTURE });
+  const app = createApp({ config: { apiKey: KEY, trustProxy }, store, worker, repos: registry, logger: silent, adminRouter });
+  const server = await startServer(app, 0, '127.0.0.1');
+  try {
+    await fn({ base: `http://127.0.0.1:${server.address().port}`, store, registry, db, pokes: () => pokes });
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((r) => server.close(r));
+    closeDb(db);
+  }
+}
+
+test('admin write: Basic auth before CSRF -> 401 with WWW-Authenticate', async () => {
+  await withAdminDb(async ({ base }) => {
+    const res = await send(base, 'POST', '/admin/api/repos', LOCAL, W);
+    assert.equal(res.status, 401);
+    assert.ok(res.headers.get('www-authenticate'));
+  });
+});
+
+test('admin write: CSRF matrix -> 403 forbidden, nothing written; same-origin and curl-style pass', async () => {
+  await withAdminDb(async ({ base, db, registry }) => {
+    const noHdr = { ...AUTH, 'content-type': 'application/json' };
+    const cases = [
+      ['POST', '/admin/api/repos', noHdr],
+      ['POST', '/admin/api/repos', { ...noHdr, 'x-admin-request': 'true' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, 'content-type': 'text/plain' }],
+      ['POST', '/admin/api/repos', { ...AUTH, 'x-admin-request': '1' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, 'content-type': 'application/x-www-form-urlencoded' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, origin: 'http://evil.example' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, origin: 'null' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, origin: base.replace('127.0.0.1', 'localhost') }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, 'sec-fetch-site': 'cross-site' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, 'sec-fetch-site': 'same-site' }],
+      ['POST', '/admin/api/repos', { ...AUTH, ...W, 'sec-fetch-site': 'none' }],
+      ['PATCH', '/admin/api/repos/loc', noHdr],
+      ['PUT', '/admin/api/repos/loc/token', noHdr],
+      ['DELETE', '/admin/api/repos/loc', noHdr],
+      ['POST', '/admin/anything', AUTH],
+    ];
+    for (const [method, p, headers] of cases) {
+      const res = await send(base, method, p, LOCAL, headers);
+      assert.equal(res.status, 403, `${method} ${p} ${JSON.stringify(headers)}`);
+      assert.match((await res.json()).error, /^forbidden: /);
+    }
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM audit_log').get().n, 0);
+    assert.equal(registry.has('loc'), false);
+
+    let res = await send(base, 'POST', '/admin/api/repos', LOCAL, { ...AUTH, ...W, origin: base, 'sec-fetch-site': 'same-origin' });
+    assert.equal(res.status, 201);
+    res = await send(base, 'POST', '/admin/api/repos', { id: 'loc2', url: '/srv/loc2.git' });
+    assert.equal(res.status, 201);
+    assert.equal((await get(base, '/admin/api/repos', AUTH)).status, 200);
+  });
+});
+
+test('admin write: TRUST_PROXY compares X-Forwarded-Host/-Proto and makes req.ip the client', async () => {
+  const proxied = { origin: 'https://agent.example.com', 'x-forwarded-host': 'agent.example.com', 'x-forwarded-proto': 'https' };
+  await withAdminDb(async ({ base, db }) => {
+    assert.equal((await send(base, 'POST', '/admin/api/repos', LOCAL, { ...AUTH, ...W, ...proxied })).status, 201);
+    const bad = { ...AUTH, ...W, ...proxied, 'x-forwarded-proto': 'http' };
+    assert.equal((await send(base, 'POST', '/admin/api/repos', { id: 'l2', url: '/srv/l2.git' }, bad)).status, 403);
+    const res = await send(base, 'POST', '/admin/api/repos', { id: 'l3', url: '/srv/l3.git' }, { ...AUTH, ...W, 'x-forwarded-for': '203.0.113.9' });
+    assert.equal(res.status, 201);
+    const row = db.prepare("SELECT ip FROM audit_log WHERE repo_id = 'l3'").get();
+    assert.equal(row.ip, '203.0.113.9');
+  }, { trustProxy: true });
+  await withAdminDb(async ({ base }) => {
+    assert.equal((await send(base, 'POST', '/admin/api/repos', LOCAL, { ...AUTH, ...W, ...proxied })).status, 403);
+  });
+});
+
+test('admin write: POST /admin/api/repos creates repos; validation, duplicate, bad JSON, size limit', async () => {
+  await withAdminDb(async ({ base }) => {
+    let res = await send(base, 'POST', '/admin/api/repos', LOCAL);
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.id, 'loc');
+    assert.equal(body.enabled, true);
+    assert.deepEqual(body.auth, { kind: 'local', token: null, ssh_key_path: null });
+    assert.equal(body.health, 'never_synced');
+    const list = await (await get(base, '/admin/api/repos', AUTH)).json();
+    assert.ok(list.some((r) => r.id === 'loc'));
+    const pub = await (await get(base, '/repos')).json();
+    assert.ok(pub.some((r) => r.id === 'loc' && r.default_branch === 'main'));
+
+    res = await send(base, 'POST', '/admin/api/repos', { id: 'web', url: 'https://github.com/o/web.git' });
+    assert.equal(res.status, 400);
+    const e1 = await res.json();
+    assert.equal(e1.problems, undefined);
+    assert.match(e1.error, /token/);
+
+    res = await send(base, 'POST', '/admin/api/repos', { id: 'web', url: 'https://github.com/o/web.git', token: HTTPS_TOKEN });
+    assert.equal(res.status, 201);
+    const text = await res.text();
+    assert.ok(!text.includes(HTTPS_TOKEN));
+    assert.equal(JSON.parse(text).auth.token.hint, '1234');
+
+    assert.equal((await send(base, 'POST', '/admin/api/repos', LOCAL)).status, 409);
+    res = await send(base, 'POST', '/admin/api/repos', { id: 'Bad!', url: '/srv/x.git' });
+    assert.equal(res.status, 400);
+    assert.ok(Array.isArray((await res.json()).problems));
+    res = await send(base, 'POST', '/admin/api/repos', '{bad');
+    assert.equal(res.status, 400);
+    assert.deepEqual(await res.json(), { error: 'invalid JSON body' });
+    res = await send(base, 'POST', '/admin/api/repos', JSON.stringify({ ...LOCAL, id: 'big', pad: 'x'.repeat(70_000) }));
+    assert.equal(res.status, 413);
+    assert.equal((await send(base, 'POST', '/admin/api/repos', [])).status, 400);
+  });
+});
+
+test('admin write: PUT /admin/api/repos/:id/token is write-only', async () => {
+  await withAdminDb(async ({ base }) => {
+    await send(base, 'POST', '/admin/api/repos', { id: 'web', url: 'https://github.com/o/web.git', token: HTTPS_TOKEN });
+    await send(base, 'POST', '/admin/api/repos', LOCAL);
+    const NEW = 'ghp_rotated_value_5678';
+    const res = await send(base, 'PUT', '/admin/api/repos/web/token', { token: NEW });
+    assert.equal(res.status, 204);
+    assert.equal(await res.text(), '');
+    const detail = await (await get(base, '/admin/api/repos/web', AUTH)).text();
+    assert.equal(JSON.parse(detail).auth.token.hint, '5678');
+    assert.ok(!detail.includes(NEW) && !detail.includes(HTTPS_TOKEN));
+    const list = await (await get(base, '/admin/api/repos', AUTH)).text();
+    assert.ok(!list.includes(NEW));
+    const audit = await (await get(base, '/admin/api/audit', AUTH)).text();
+    assert.ok(!audit.includes(NEW));
+    assert.equal((await send(base, 'PUT', '/admin/api/repos/nope/token', { token: NEW })).status, 404);
+    assert.equal((await send(base, 'PUT', '/admin/api/repos/loc/token', { token: NEW })).status, 400);
+    assert.equal((await send(base, 'PUT', '/admin/api/repos/web/token', { token: 'a b' })).status, 400);
+  });
+});
+
+test('admin write: PATCH enable/disable gates POST /<repo>/run-agent; validation; URL change blocked by a running job', async () => {
+  await withAdminDb(async ({ base, store, pokes }) => {
+    await send(base, 'POST', '/admin/api/repos', LOCAL);
+    let res = await send(base, 'PATCH', '/admin/api/repos/loc', { enabled: false });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).enabled, false);
+    assert.ok(pokes() >= 1);
+    res = await post(base, { prompt: 'x' }, { 'x-api-key': KEY }, 'loc');
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), { error: 'repo disabled' });
+    assert.equal((await get(base, '/loc/run-agent')).status, 200);
+    assert.equal((await send(base, 'PATCH', '/admin/api/repos/loc', { enabled: true })).status, 200);
+    assert.equal((await post(base, { prompt: 'x' }, { 'x-api-key': KEY }, 'loc')).status, 202);
+
+    assert.equal((await send(base, 'PATCH', '/admin/api/repos/loc', { id: 'x' })).status, 400);
+    assert.equal((await send(base, 'PATCH', '/admin/api/repos/loc', {})).status, 400);
+    assert.equal((await send(base, 'PATCH', '/admin/api/repos/nope', { enabled: false })).status, 404);
+
+    const j = store.create({ prompt: 'p', branch: 'main', repoId: 'loc' });
+    store.transition(j.id, 'pulling');
+    res = await send(base, 'PATCH', '/admin/api/repos/loc', { url: '/srv/other.git' });
+    assert.equal(res.status, 409);
+  });
+});
+
+test('admin write: DELETE needs no active jobs; history stays filterable', async () => {
+  await withAdminDb(async ({ base, store }) => {
+    await send(base, 'POST', '/admin/api/repos', LOCAL);
+    const j = store.create({ prompt: 'p', branch: 'main', repoId: 'loc' });
+    assert.equal((await send(base, 'DELETE', '/admin/api/repos/loc')).status, 409);
+    store.transition(j.id, 'failed', { error: 'x' });
+    const res = await send(base, 'DELETE', '/admin/api/repos/loc');
+    assert.equal(res.status, 204);
+    assert.equal((await get(base, '/admin/api/repos/loc', AUTH)).status, 404);
+    const gone = await get(base, `/loc/run-agent/${j.id}`);
+    assert.equal(gone.status, 404);
+    assert.deepEqual(await gone.json(), { error: 'repo not found' });
+    const hist = await get(base, '/admin/api/jobs?repo=loc', AUTH);
+    assert.equal(hist.status, 200);
+    assert.deepEqual((await hist.json()).jobs.map((x) => x.id), [j.id]);
+  });
+});
+
+test('admin write: GET /admin/api/audit lists changes newest first with a cursor, never the token', async () => {
+  await withAdminDb(async ({ base }) => {
+    await send(base, 'POST', '/admin/api/repos', { id: 'web', url: 'https://github.com/o/web.git', token: 'ghp_first_value_0000' });
+    await send(base, 'PUT', '/admin/api/repos/web/token', { token: HTTPS_TOKEN });
+    await send(base, 'PATCH', '/admin/api/repos/web', { enabled: false });
+    assert.equal((await send(base, 'DELETE', '/admin/api/repos/web')).status, 204);
+
+    const all = await (await get(base, '/admin/api/audit', AUTH)).json();
+    assert.deepEqual(all.entries.map((e) => e.action), ['repo.delete', 'repo.disable', 'token.set', 'repo.create']);
+    for (const e of all.entries) {
+      assert.equal(e.actor, 'ops');
+      assert.match(e.ip, /127\.0\.0\.1/);
+      assert.equal(e.repo_id, 'web');
+    }
+    assert.equal(all.next, null);
+    const json = JSON.stringify(all.entries);
+    assert.ok(!json.includes(HTTPS_TOKEN) && !json.includes('ghp_first_value_0000'));
+    assert.match(all.entries.find((e) => e.action === 'token.set').details.token, /set …1234/);
+
+    const p1 = await (await get(base, '/admin/api/audit?limit=2', AUTH)).json();
+    assert.equal(p1.entries.length, 2);
+    assert.equal(p1.next, p1.entries[1].id);
+    const p2 = await (await get(base, `/admin/api/audit?limit=2&before=${p1.next}`, AUTH)).json();
+    assert.deepEqual(p2.entries.map((e) => e.action), ['token.set', 'repo.create']);
+    assert.equal(p2.next, null);
+    assert.deepEqual((await (await get(base, '/admin/api/audit?repo=other', AUTH)).json()).entries, []);
+    for (const q of ['limit=0', 'before=abc', 'repo=Bad_Id']) {
+      assert.equal((await get(base, `/admin/api/audit?${q}`, AUTH)).status, 400, q);
+    }
+    assert.equal((await get(base, '/admin/api/audit', {})).status, 401);
+  });
 });

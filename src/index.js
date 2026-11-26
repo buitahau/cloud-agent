@@ -44,7 +44,9 @@ import { createApp, startServer } from './server.js';
  *     store  = createJobStore({ logsTailLines, retentionMax: jobRetentionMax, onPersist: persistence?.append })
  *     if persistence: store.hydrate(persistence.load()); persistence.compact(...)
  *       console.log(`Jobs file: <file> (<n> jobs loaded, <m> interrupted)`)
- *     repos  = createRepoRegistry({ repoStore, workspaceRoot, gitTimeoutMs, secretEnvNames })   (one GitSync per stored repo)
+ *     repos  = createRepoRegistry({ repoStore, jobs: store, workspaceRoot, gitTimeoutMs, secretEnvNames, allowLocal, sshKeysDir })
+ *              (one GitSync per stored repo; mutable at runtime through the admin API, which needs the job store to
+ *              refuse changes while jobs are active and the validation rules for new/edited repos)
  *     runner = createClaudeRunner({ claudeBin, permissionMode, maxTurns, timeoutMs: jobTimeoutMs, secretEnvNames })   (shared)
  *     worker = createWorker({ store, repos, claudeRunner: runner, maxConcurrent: maxConcurrentJobs })
  *     app    = createApp({ config, store, worker, repos, adminRouter? })   (admin only if ADMIN_PASSWORD is set)
@@ -158,7 +160,15 @@ export async function main() {
     persistence.compact(store.list().map((j) => store.snapshot(j)));
     console.log(`Jobs file: ${config.jobsFile} (${loaded} jobs loaded, ${interrupted} interrupted)`);
   }
-  const repos = createRepoRegistry({ repoStore, workspaceRoot: config.workspaceRoot, gitTimeoutMs: config.gitTimeoutMs, secretEnvNames });
+  const repos = createRepoRegistry({
+    repoStore,
+    jobs: store,
+    workspaceRoot: config.workspaceRoot,
+    gitTimeoutMs: config.gitTimeoutMs,
+    secretEnvNames,
+    allowLocal: config.allowLocalRepos,
+    sshKeysDir: config.sshKeysDir,
+  });
   const runner = createClaudeRunner({
     claudeBin: config.claudeBin,
     permissionMode: config.claudePermissionMode,
@@ -169,7 +179,7 @@ export async function main() {
   const worker = createWorker({ store, repos, claudeRunner: runner, maxConcurrent: config.maxConcurrentJobs });
   const adminRouter = config.adminPassword
     ? createAdminRouter({
-      config: { adminUser: config.adminUser, adminPassword: config.adminPassword },
+      config: { adminUser: config.adminUser, adminPassword: config.adminPassword, trustProxy: config.trustProxy },
       store,
       worker,
       repos,
@@ -179,7 +189,7 @@ export async function main() {
   const app = createApp({ config, store, worker, repos, adminRouter });
   const ids = repos.ids();
   if (ids.length === 0) {
-    console.warn('WARNING: no repos configured (empty database and nothing to import from REPOS_FILE); repo management in the admin dashboard comes in a later release');
+    console.warn(`WARNING: no repos configured (empty database and nothing to import from REPOS_FILE); add one with POST /admin/api/repos${adminRouter ? '' : ' (set ADMIN_PASSWORD to enable the admin API)'}`);
   }
   console.log(`Repos: ${ids.length ? ids.join(', ') : '(none)'} (max ${config.maxConcurrentJobs} concurrent job${config.maxConcurrentJobs === 1 ? '' : 's'})`);
   console.log(adminRouter ? 'Admin dashboard: /admin/' : 'Admin dashboard: disabled (set ADMIN_PASSWORD to enable)');

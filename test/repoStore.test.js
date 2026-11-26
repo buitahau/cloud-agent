@@ -222,3 +222,59 @@ test('meta upsert and audit rows', () => {
   assert.equal(rows[1].repo_id, null);
   assert.equal(rows[1].details, '{}');
 });
+
+test('updateRepo changes url/kind/branch/key and bumps updatedAt; setEnabled toggles enabled', () => {
+  let t = 0;
+  const now = () => new Date(Date.UTC(2026, 0, 1, 0, 0, t++)).toISOString();
+  const { store } = fresh(undefined, now);
+  store.insertRepo(https('web'));
+  const before = store.get('web');
+  store.updateRepo('web', { id: 'web', url: 'git@h:o/r', kind: 'ssh', defaultBranch: 'dev', sshKeyPath: sshKey });
+  const r = store.get('web');
+  assert.deepEqual([r.url, r.kind, r.defaultBranch, r.sshKeyPath], ['git@h:o/r', 'ssh', 'dev', sshKey]);
+  assert.equal(r.createdAt, before.createdAt);
+  assert.ok(r.updatedAt > before.updatedAt);
+  store.setEnabled('web', false);
+  assert.equal(store.get('web').enabled, false);
+  assert.ok(store.get('web').updatedAt > r.updatedAt);
+  store.setEnabled('web', true);
+  assert.equal(store.get('web').enabled, true);
+});
+
+test('deleteRepo cascades secrets; deleteSecret removes the token', () => {
+  const { db, store } = fresh();
+  store.insertRepo(https('web'));
+  store.insertRepo(https('app'));
+  store.setToken('web', TOK);
+  store.setToken('app', TOK);
+  store.deleteSecret('app');
+  assert.equal(store.tokenInfo('app'), null);
+  assert.equal(store.getToken('app'), null);
+  assert.notEqual(store.tokenInfo('web'), null);
+  store.deleteRepo('web');
+  assert.equal(store.get('web'), null);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM repo_secrets').get().n, 0);
+});
+
+test('listAudit: newest first, id cursor, repo filter, parsed details', () => {
+  const { store } = fresh();
+  for (const [repoId, n] of [['web', 1], ['api', 2], ['web', 3], ['api', 4], ['web', 5]]) {
+    store.insertAudit({ actor: 'ops', action: 'repo.update', repoId, details: { n } });
+  }
+  let r = store.listAudit({ limit: 2 });
+  assert.deepEqual(r.entries.map((e) => e.id), [5, 4]);
+  assert.equal(r.next, 4);
+  r = store.listAudit({ limit: 2, before: 4 });
+  assert.deepEqual(r.entries.map((e) => e.id), [3, 2]);
+  assert.equal(r.next, 2);
+  r = store.listAudit({ limit: 2, before: 2 });
+  assert.deepEqual(r.entries.map((e) => e.id), [1]);
+  assert.equal(r.next, null);
+  r = store.listAudit({ repoId: 'api' });
+  assert.deepEqual(r.entries.map((e) => e.repo_id), ['api', 'api']);
+  assert.equal(r.next, null);
+  assert.deepEqual(r.entries[0].details, { n: 4 });
+  assert.deepEqual(Object.keys(r.entries[0]).sort(), ['action', 'actor', 'at', 'details', 'id', 'ip', 'repo_id']);
+  assert.equal(r.entries[0].ip, null);
+  assert.deepEqual(store.listAudit().entries.length, 5);
+});

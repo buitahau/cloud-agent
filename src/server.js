@@ -21,7 +21,8 @@ export function formatSse(evt) {
 
 /**
  * @typedef {Object} AppDeps
- * @property {{ apiKey: string }} config   (full Config is fine)
+ * @property {{ apiKey: string, trustProxy?: boolean }} config   (full Config is fine). trustProxy: honour
+ *           X-Forwarded-For/-Proto from a loopback/private-network proxy (req.ip, req.protocol)
  * @property {import('./jobStore.js').JobStore} store
  * @property {Pick<import('./worker.js').Worker, 'enqueue'>} worker
  * @property {Pick<import('./repoRegistry.js').RepoRegistry, 'get'|'has'|'list'>} repos
@@ -36,13 +37,14 @@ export function formatSse(evt) {
 /**
  * Build the express app (does NOT listen — tests call startServer(app, 0)).
  *
- * Every job endpoint names its repo in the path; <repo> is an id from REPOS_FILE.
+ * Every job endpoint names its repo in the path; <repo> is a repo id (repos are managed through the admin API).
  *
  *  - GET  /health                         -> 200 { ok: true }                (NO auth; liveness only, lists nothing)
  *  - /admin/...                           -> admin dashboard + API (own auth; only if deps.adminRouter)
  *  - GET  /repos                          -> 200 [{ id, default_branch }]   (x-api-key)
  *  - /<repo>/run-agent...                 (x-api-key checked first, then the repo: unknown -> 404 { error: 'repo not found' })
  *    - POST /<repo>/run-agent  { prompt, branch? }
+ *          repo disabled -> 409 { error: 'repo disabled' }   (GETs on a disabled repo still work)
  *          v = validateRunAgentBody(req.body); !v.ok -> 400 { error }
  *          job = store.create({ prompt, branch: v.branch ?? repo.defaultBranch, repoId })
  *          worker.enqueue(job.id)      // synchronous; MUST NOT await the run (T2: < 1s)
@@ -75,6 +77,7 @@ export function createApp(deps) {
   const sse = makeSse((req) => findRepoJob(store, req));
   const app = /** @type {any} */ (express());
   app.disable('x-powered-by');
+  if (config.trustProxy) app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 
   app.get('/health', (_req, res) => {
     res.status(200).json({ ok: true });
@@ -99,12 +102,16 @@ export function createApp(deps) {
   }, repoRouter);
 
   repoRouter.post('/', (req, res) => {
+    const repo = /** @type {any} */ (repos.get(req.params.repo)).config;
+    if (repo.enabled === false) {
+      res.status(409).json({ error: 'repo disabled' });
+      return;
+    }
     const v = validateRunAgentBody(req.body);
     if (!v.ok) {
       res.status(400).json({ error: v.error });
       return;
     }
-    const repo = /** @type {any} */ (repos.get(req.params.repo)).config;
     const job = store.create({ prompt: v.prompt, branch: v.branch ?? repo.defaultBranch, repoId: repo.id });
     worker.enqueue(job.id);
     res.status(202).json({ id: job.id, status: job.status });

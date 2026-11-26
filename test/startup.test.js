@@ -16,7 +16,7 @@ const MK = crypto.randomBytes(32).toString('base64');
 function cleanEnv(extra) {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (/^(REPO_|REPOS_FILE|WORKSPACE_DIR|GIT_|CLAUDE|ANTHROPIC_|API_KEY|PORT|JOB_|LOGS_TAIL|FAKE_CLAUDE|MAX_CONCURRENT|ADMIN_|MASTER_KEY|DB_FILE|WORKSPACE_ROOT|SSH_KEYS_DIR|ALLOW_LOCAL_REPOS)/.test(k)) delete env[k];
+    if (/^(REPO_|REPOS_FILE|WORKSPACE_DIR|GIT_|CLAUDE|ANTHROPIC_|API_KEY|PORT|JOB_|LOGS_TAIL|FAKE_CLAUDE|MAX_CONCURRENT|ADMIN_|MASTER_KEY|DB_FILE|WORKSPACE_ROOT|SSH_KEYS_DIR|ALLOW_LOCAL_REPOS|TRUST_PROXY)/.test(k)) delete env[k];
   }
   return { ...env, ...extra };
 }
@@ -294,4 +294,38 @@ test('claude never sees API_KEY, ADMIN_PASSWORD, MASTER_KEY or repo tokens', asy
     s.child.kill('SIGTERM');
     assert.equal((await s.withTimeout(10_000)).code, 0);
   } finally { s.child.kill('SIGKILL'); s.cleanup(); }
+});
+
+test('admin API: a repo created over HTTP is persisted and loaded on the next start', async () => {
+  const env = { ADMIN_PASSWORD: 'admin-pw-123456' };
+  const s1 = startService(env, { repos: null });
+  try {
+    const port = Number((await s1.waitFor(/Listening on :(\d+)/))[1]);
+    const res = await fetch(`http://127.0.0.1:${port}/admin/api/repos`, {
+      method: 'POST',
+      headers: {
+        authorization: `Basic ${Buffer.from('admin:admin-pw-123456').toString('base64')}`,
+        'content-type': 'application/json',
+        'x-admin-request': '1',
+      },
+      body: JSON.stringify({ id: 'loc', url: path.join(s1.cwd, 'loc.git') }),
+    });
+    assert.equal(res.status, 201, await res.clone().text());
+    await s1.waitFor(/\[audit\] admin \(.+\) repo\.create loc /);
+    s1.child.kill('SIGTERM');
+    assert.equal((await s1.withTimeout(10_000)).code, 0);
+  } catch (err) {
+    s1.child.kill('SIGKILL');
+    s1.cleanup();
+    throw err;
+  }
+  const s2 = startService(env, { cwd: s1.cwd, repos: null });
+  try {
+    await s2.waitFor(/Repos: loc/);
+    const port = Number((await s2.waitFor(/Listening on :(\d+)/))[1]);
+    const r = await fetch(`http://127.0.0.1:${port}/repos`, { headers: { 'x-api-key': 'k' } });
+    assert.deepEqual(await r.json(), [{ id: 'loc', default_branch: 'main' }]);
+    s2.child.kill('SIGTERM');
+    assert.equal((await s2.withTimeout(10_000)).code, 0);
+  } finally { s2.child.kill('SIGKILL'); s2.cleanup(); }
 });

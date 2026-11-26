@@ -1,12 +1,21 @@
 // src/admin.js
-// Read-only admin dashboard: React single-page app (built from web/ into web/dist by `npm run build:web`) + JSON API
-// under /admin/api, behind HTTP Basic auth with its own credentials (ADMIN_USER / ADMIN_PASSWORD). Not mounted at
-// all when ADMIN_PASSWORD is unset.
+// Admin dashboard: React single-page app (built from web/ into web/dist by `npm run build:web`) + JSON API under
+// /admin/api, behind HTTP Basic auth with its own credentials (ADMIN_USER / ADMIN_PASSWORD). Not mounted at all when
+// ADMIN_PASSWORD is unset.
 //
 // Basic auth is used because the browser shows its own prompt and resends the credentials automatically on
 // same-origin requests — including EventSource, so the live job view needs no fetch-stream workaround.
-// Everything here is GET-only. Any future state-changing action must add CSRF checks (Origin / custom header),
-// because browsers attach Basic credentials automatically.
+// GET routes are read-only. Writes (POST/PATCH/PUT/DELETE under /admin/api/repos) — in fact every non-GET/HEAD
+// request under /admin — must pass the CSRF checks in src/lib/csrf.js (application/json + X-Admin-Request: 1 +
+// same-origin Origin/Sec-Fetch-Site), because browsers attach Basic credentials automatically. basicAuth runs
+// first (cross-site requests without credentials still get 401) and bodies are parsed only after the CSRF check.
+//
+// CSP vs CSRF: `form-action 'none'` and `default-src 'self'` (which also sets connect-src) only restrict OUR pages
+// (no form posts, no fetches to other origins); they do nothing against another site targeting us — that is what
+// csrf.js is for. A form can't send custom headers or application/json; a cross-origin fetch with them triggers a
+// preflight, which we never answer with Access-Control-Allow-*, so the real request is never sent.
+// XSS: script injected into our origin would pass CSRF; that is mitigated by script-src 'self' (no unsafe-inline)
+// and the "no innerHTML" test. Keep the CSP unchanged. ADMIN_PASSWORD is a write credential.
 
 import express from 'express';
 import fs from 'node:fs';
@@ -14,15 +23,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual, createHash } from 'node:crypto';
 import { STATUS } from './jobStore.js';
-import { isValidRepoId, validateJobListQuery } from './lib/validate.js';
+import { isValidRepoId, validateJobListQuery, MAX_LIST_LIMIT } from './lib/validate.js';
+import { csrfGuard } from './lib/csrf.js';
+import { RepoMutationError } from './repoRegistry.js';
 
 const DEFAULT_PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web', 'dist');
 
 /**
  * @param {Object} deps
- * @param {{ adminUser: string, adminPassword: string, maxConcurrentJobs?: number }} deps.config
+ * @param {{ adminUser: string, adminPassword: string, trustProxy?: boolean, maxConcurrentJobs?: number }} deps.config
  * @param {import('./jobStore.js').JobStore} deps.store
- * @param {Pick<import('./worker.js').Worker, 'stats'|'queueLength'>} deps.worker
+ * @param {Pick<import('./worker.js').Worker, 'stats'|'queueLength'|'poke'>} deps.worker
  * @param {import('./repoRegistry.js').RepoRegistry} deps.repos
  * @param {boolean} [deps.persistence=false]   whether JOBS_FILE is on (shown on the overview)
  * @param {() => number} [deps.now]            ms clock (tests)
@@ -39,10 +50,12 @@ export function createAdminRouter(deps) {
     const router = express.Router();
     router.use(securityHeaders);
     router.use(basicAuth(config.adminUser, config.adminPassword));
+    router.use(csrfGuard({ trustProxy: Boolean(config.trustProxy) })); // every non-GET/HEAD admin request
 
     // ---- JSON API ----
     const api = express.Router();
     api.use((_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+    api.use(express.json({ limit: '64kb' }));
 
     api.get('/summary', (_req, res) => {
       const counts = Object.fromEntries(Object.values(STATUS).map((s) => [s, 0]));
@@ -86,9 +99,10 @@ export function createAdminRouter(deps) {
         return;
       }
       let repoId = null;
+      // Any valid id, so a deleted repo's job history can still be filtered.
       if (typeof req.query.repo === 'string' && req.query.repo !== '') {
-        if (!repos.has(req.query.repo)) {
-          res.status(400).json({ error: 'unknown repo' });
+        if (!isValidRepoId(req.query.repo)) {
+          res.status(400).json({ error: 'repo must be a valid repo id' });
           return;
         }
         repoId = req.query.repo;
@@ -117,6 +131,54 @@ export function createAdminRouter(deps) {
       next();
     }, sse);
 
+    // ---- repo writes (CSRF-checked above) ----
+    /** @param {import('express').Request} req @returns {import('./repoRegistry.js').MutationContext} */
+    const ctx = (req) => ({ actor: config.adminUser, ip: req.ip ?? null });
+    /** RepoMutationError -> its status + { error, problems? }; anything else -> the app error handler. */
+    const fail = (err, res, next) => {
+      if (!(err instanceof RepoMutationError)) { next(err); return; }
+      res.status(err.status).json(err.problems ? { error: err.message, problems: err.problems } : { error: err.message });
+    };
+
+    api.post('/repos', (req, res, next) => {
+      try {
+        const c = repos.create(req.body, ctx(req));
+        res.status(201).json(repos.status(c.id, store, worker));
+      } catch (err) { fail(err, res, next); }
+    });
+
+    api.patch('/repos/:id', (req, res, next) => {
+      try {
+        repos.update(req.params.id, req.body, ctx(req));
+        worker.poke(); // a disabled repo's queued jobs fail right away
+        res.json(repos.status(req.params.id, store, worker));
+      } catch (err) { fail(err, res, next); }
+    });
+
+    api.put('/repos/:id/token', (req, res, next) => {
+      try {
+        const body = req.body !== null && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+        repos.setToken(req.params.id, body.token, ctx(req));
+        res.status(204).end();
+      } catch (err) { fail(err, res, next); }
+    });
+
+    api.delete('/repos/:id', (req, res, next) => {
+      try {
+        repos.remove(req.params.id, ctx(req));
+        res.status(204).end();
+      } catch (err) { fail(err, res, next); }
+    });
+
+    api.get('/audit', (req, res) => {
+      const q = validateAuditQuery(/** @type {any} */ (req.query));
+      if (!q.ok) {
+        res.status(400).json({ error: q.error });
+        return;
+      }
+      res.json(repos.listAudit({ repoId: q.repoId, limit: q.limit, before: q.before }));
+    });
+
     api.use((_req, res) => { res.status(404).json({ error: 'not found' }); });
 
     router.use('/api', api);
@@ -124,6 +186,35 @@ export function createAdminRouter(deps) {
     router.use((_req, res) => { res.status(404).json({ error: 'not found' }); });
     return router;
   };
+}
+
+/**
+ * ?repo=&limit=&before= of GET /admin/api/audit. repo = any valid id (deleted repos included), before = audit id
+ * (exclusive cursor).
+ * @param {Record<string, unknown>} query
+ * @returns {{ ok: true, repoId: string|null, limit: number, before: number|null } | { ok: false, error: string }}
+ */
+export function validateAuditQuery(query) {
+  const q = query ?? {};
+  let repoId = null;
+  if (q.repo !== undefined && q.repo !== '') {
+    if (!isValidRepoId(q.repo)) return { ok: false, error: 'repo must be a valid repo id' };
+    repoId = /** @type {string} */ (q.repo);
+  }
+  let limit = 50;
+  if (q.limit !== undefined && q.limit !== '') {
+    const n = Number(q.limit);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_LIST_LIMIT) {
+      return { ok: false, error: `limit must be an integer between 1 and ${MAX_LIST_LIMIT}` };
+    }
+    limit = n;
+  }
+  let before = null;
+  if (q.before !== undefined && q.before !== '') {
+    if (typeof q.before !== 'string' || !/^[1-9]\d{0,15}$/.test(q.before)) return { ok: false, error: 'before must be an audit entry id' };
+    before = Number(q.before);
+  }
+  return { ok: true, repoId, limit, before };
 }
 
 /**

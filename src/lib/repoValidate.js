@@ -1,6 +1,6 @@
 // src/lib/repoValidate.js
 // Validation of one repo definition (id, url, defaultBranch, sshKeyPath) and of a repo token. Shared by the
-// repos.json importer, the startup check of stored repos and (later) the admin API. Pure apart from
+// repos.json importer, the startup check of stored repos and the admin API. Pure apart from
 // fs.existsSync for the ssh key file. Never puts token values in error messages.
 
 import fs from 'node:fs';

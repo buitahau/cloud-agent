@@ -31,6 +31,8 @@ export const PERMISSION_MODES = Object.freeze([
  * @property {string}      workspaceRoot        WORKSPACE_ROOT (default "./workspaces"), absolute; repos are cloned to <workspaceRoot>/<id>
  * @property {import('./secrets.js').KeyRing} keyRing  from MASTER_KEY (+ MASTER_KEY_PREVIOUS); never holds raw key strings
  * @property {boolean}     allowLocalRepos      ALLOW_LOCAL_REPOS (default false): allow absolute-path / file:// repos
+ * @property {boolean}     trustProxy           TRUST_PROXY (default false): trust X-Forwarded-For/-Proto/-Host from a
+ *                                              loopback/private-network proxy (audit ip, admin CSRF origin check)
  * @property {string}      sshKeysDir           SSH_KEYS_DIR (default "/run/ssh-keys", ~-expanded): ssh keys must live inside it
  * @property {string}      claudeBin            CLAUDE_BIN (default "claude")
  * @property {string}      claudePermissionMode CLAUDE_PERMISSION_MODE (default "bypassPermissions"), one of PERMISSION_MODES
@@ -149,6 +151,7 @@ export function loadConfig(env, opts = {}) {
   }
   if (isSameOrInside(dbFile, workspaceRoot)) problems.push(`DB_FILE must not be inside WORKSPACE_ROOT (${dbFile})`);
   const allowLocalRepos = bool('ALLOW_LOCAL_REPOS', false);
+  const trustProxy = bool('TRUST_PROXY', false);
   const sshKeysDir = path.resolve(cwd, expandHome(get('SSH_KEYS_DIR') ?? '/run/ssh-keys'));
 
   const masterKey = get('MASTER_KEY');
@@ -169,6 +172,7 @@ export function loadConfig(env, opts = {}) {
     workspaceRoot,
     keyRing: /** @type {import('./secrets.js').KeyRing} */ (keyRing),
     allowLocalRepos,
+    trustProxy,
     sshKeysDir,
     claudeBin: get('CLAUDE_BIN') ?? 'claude',
     claudePermissionMode,
