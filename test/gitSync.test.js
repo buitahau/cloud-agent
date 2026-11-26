@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createGitSync, buildGitEnv, normalizeRemote, GitSyncError } from '../src/gitSync.js';
+import { SecretDecryptError } from '../src/secrets.js';
 import { createGitFixture, git } from '../test-support/gitFixture.js';
 
 function setup(over = {}) {
@@ -145,7 +146,7 @@ test('log callback receives "[git] $ git ..." lines', async () => {
     const cmds = lines.filter((l) => l.startsWith('[git] $ '));
     assert.deepEqual(cmds, [
       `[git] $ git clone --no-checkout -- ${fx.originUrl} ${fx.workspaceDir}`,
-      '[git] $ git fetch --prune origin +refs/heads/main:refs/remotes/origin/main',
+      '[git] $ git fetch --upload-pack=git-upload-pack --prune origin +refs/heads/main:refs/remotes/origin/main',
       '[git] $ git checkout -f -B main origin/main',
       '[git] $ git reset --hard origin/main',
       '[git] $ git clean -fdx -e node_modules',
@@ -158,18 +159,26 @@ test('log callback receives "[git] $ git ..." lines', async () => {
 test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+token -> GIT_CONFIG_* header; token never in argv', async () => {
   const base = { PATH: '/bin' };
   const plain = buildGitEnv({ baseEnv: base, repoUrl: 'git@github.com:o/r.git' });
-  assert.deepEqual(plain, { PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'https:ssh:file', GIT_TRACE_REDACT: '1' });
+  assert.deepEqual(plain, {
+    PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'ssh', GIT_TRACE_REDACT: '1',
+    GIT_CONFIG_COUNT: '4',
+    GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+    GIT_CONFIG_KEY_1: 'core.fsmonitor', GIT_CONFIG_VALUE_1: 'false',
+    GIT_CONFIG_KEY_2: 'credential.helper', GIT_CONFIG_VALUE_2: '',
+    GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
+  });
   assert.deepEqual(base, { PATH: '/bin' });
 
   const ssh = buildGitEnv({ baseEnv: base, repoUrl: 'git@github.com:o/r.git', sshKeyPath: '/home/u/.ssh/id', token: 'tok' });
   assert.equal(ssh.GIT_SSH_COMMAND, "ssh -i '/home/u/.ssh/id' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new");
-  assert.equal(ssh.GIT_CONFIG_COUNT, undefined); // token only applies to https URLs
+  assert.equal(ssh.GIT_CONFIG_COUNT, '4'); // token only applies to https URLs
+  assert.ok(!Object.values(ssh).some((v) => String(v).startsWith('Authorization')));
   assert.throws(() => buildGitEnv({ baseEnv: base, repoUrl: 'x', sshKeyPath: "/a'b" }), GitSyncError);
 
   const https = buildGitEnv({ baseEnv: base, repoUrl: 'https://github.com/o/r.git', token: 'ghp_secret' });
-  assert.equal(https.GIT_CONFIG_COUNT, '1');
-  assert.equal(https.GIT_CONFIG_KEY_0, 'http.https://github.com/.extraHeader'); // token only sent to the repo's own host
-  assert.equal(https.GIT_CONFIG_VALUE_0, `Authorization: Basic ${Buffer.from('x-access-token:ghp_secret').toString('base64')}`);
+  assert.equal(https.GIT_CONFIG_COUNT, '5');
+  assert.equal(https.GIT_CONFIG_KEY_4, 'http.https://github.com/.extraHeader'); // token only sent to the repo's own host
+  assert.equal(https.GIT_CONFIG_VALUE_4, `Authorization: Basic ${Buffer.from('x-access-token:ghp_secret').toString('base64')}`);
 
   // token is passed via env only, never argv
   const calls = [];
@@ -178,14 +187,14 @@ test('buildGitEnv: GIT_TERMINAL_PROMPT=0; ssh key -> GIT_SSH_COMMAND; https+toke
     return { code: 1, signal: null, stdout: '', stderr: 'fatal: nope\n', timedOut: false, aborted: false, truncated: false, spawnError: null, durationMs: 1 };
   };
   const gs = createGitSync({
-    repoUrl: 'https://github.com/o/r.git', token: 'ghp_secret', workspaceDir: '/tmp/cloud-agent-never-exists-xyz/ws', timeoutMs: 1000, run: stub,
+    repoUrl: 'https://github.com/o/r.git', getToken: () => 'ghp_secret', workspaceDir: '/tmp/cloud-agent-never-exists-xyz/ws', timeoutMs: 1000, run: stub,
     baseEnv: { PATH: '/bin', API_KEY: 'k', MY_PAT: 'x' }, secretEnvNames: ['MY_PAT'],
   });
   await assert.rejects(gs.sync('main'), /git clone failed: fatal: nope/);
   assert.equal(calls.length, 1);
   assert.ok(!calls[0].args.join(' ').includes('ghp_secret'));
   assert.equal(calls[0].env.GIT_TERMINAL_PROMPT, '0');
-  assert.ok(calls[0].env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic '));
+  assert.ok(calls[0].env.GIT_CONFIG_VALUE_4.startsWith('Authorization: Basic '));
   assert.equal(calls[0].env.API_KEY, undefined);
   assert.equal(calls[0].env.MY_PAT, undefined);
   assert.equal(calls[0].env.GIT_TRACE_REDACT, '1');
@@ -204,7 +213,7 @@ test("buildGitEnv strips service secrets, keeps the repo's own header, forces GI
   }
   assert.equal(env.GIT_TRACE_REDACT, '1');
   assert.equal(env.GIT_AUTHOR_NAME, 'a');
-  assert.ok(env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic '));
+  assert.ok(env.GIT_CONFIG_VALUE_4.startsWith('Authorization: Basic '));
   assert.deepEqual(base, snapshot);
 });
 
@@ -251,4 +260,120 @@ test('GIT_ALLOW_PROTOCOL blocks ext:: remotes even if one reached git', async ()
     await rejectsStep(gs.sync('main'), 'clone');
     assert.equal(fs.existsSync(marker), false);
   } finally { fx.cleanup(); }
+});
+
+const failRun = (calls) => async (o) => {
+  calls.push(o);
+  return { code: 1, signal: null, stdout: '', stderr: 'fatal: nope\n', timedOut: false, aborted: false, truncated: false, spawnError: null, durationMs: 1 };
+};
+const basicOf = (tok) => `Authorization: Basic ${Buffer.from(`x-access-token:${tok}`).toString('base64')}`;
+
+test('getToken is called once per sync (https only), so a changed token is used by the next sync', async () => {
+  const calls = [];
+  const toks = ['tok-1', 'tok-2'];
+  let n = 0;
+  const gs = createGitSync({
+    repoUrl: 'https://github.com/o/r.git', getToken: () => toks[n++], workspaceDir: '/tmp/cloud-agent-never-exists-gt/ws',
+    timeoutMs: 1000, run: failRun(calls), baseEnv: { PATH: '/bin' },
+  });
+  try {
+    await assert.rejects(gs.sync('main'), /git clone failed/);
+    await assert.rejects(gs.sync('main'), /git clone failed/);
+    assert.equal(n, 2);
+    assert.equal(calls[0].env.GIT_CONFIG_VALUE_4, basicOf('tok-1'));
+    assert.equal(calls[1].env.GIT_CONFIG_VALUE_4, basicOf('tok-2'));
+  } finally {
+    fs.rmSync('/tmp/cloud-agent-never-exists-gt', { recursive: true, force: true });
+  }
+});
+
+test('getToken is not called for a local repo URL', async () => {
+  let n = 0;
+  const { fx, gs } = setup({ getToken: () => { n++; return 'x'; } });
+  try {
+    await gs.sync('main');
+    assert.equal(n, 0);
+  } finally { fx.cleanup(); }
+});
+
+test('getToken failures -> GitSyncError("validate") without the cause text and without running git; null -> no header', async () => {
+  const mk = (getToken, calls) => createGitSync({
+    repoUrl: 'https://github.com/o/r.git', getToken, workspaceDir: '/tmp/cloud-agent-never-exists-gt2/ws',
+    timeoutMs: 1000, run: failRun(calls), baseEnv: { PATH: '/bin' },
+  });
+  try {
+    const calls = [];
+    await assert.rejects(mk(() => { throw new SecretDecryptError('auth-failed', 'marker-xyz'); }, calls).sync('main'), (err) => {
+      assert.ok(err instanceof GitSyncError);
+      assert.equal(err.step, 'validate');
+      assert.equal(err.message, 'git validate failed: token cannot be decrypted');
+      assert.ok(!err.message.includes('marker-xyz'));
+      return true;
+    });
+    await assert.rejects(mk(() => { throw new Error('marker-abc'); }, calls).sync('main'), (err) => /token could not be read/.test(err.message) && !err.message.includes('marker-abc'));
+    assert.equal(calls.length, 0);
+    await assert.rejects(mk(() => null, calls).sync('main'), /git clone failed/);
+    assert.equal(calls[0].env.GIT_CONFIG_COUNT, '4');
+  } finally {
+    fs.rmSync('/tmp/cloud-agent-never-exists-gt2', { recursive: true, force: true });
+  }
+});
+
+test('hooks, fsmonitor, uploadpack and credential helper planted in the workspace .git/config never run', async () => {
+  const { fx, gs } = setup();
+  try {
+    await gs.sync('main');
+    const ws = fx.workspaceDir;
+    const script = (name, marker, tail = '') => {
+      const f = path.join(fx.root, name);
+      fs.writeFileSync(f, `#!/bin/sh\ntouch '${path.join(fx.root, marker)}'\n${tail}`, { mode: 0o755 });
+      return f;
+    };
+    // control: a planted hook does run under plain git
+    const hook = path.join(ws, '.git', 'hooks', 'post-checkout');
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.writeFileSync(hook, `#!/bin/sh\ntouch '${path.join(fx.root, 'RAN_hook')}'\n`, { mode: 0o755 });
+    git(['checkout', '-q', '-f', 'main'], ws);
+    assert.equal(fs.existsSync(path.join(fx.root, 'RAN_hook')), true, 'control: hook runs without hardening');
+    fs.rmSync(path.join(fx.root, 'RAN_hook'));
+
+    const hooksDir = path.join(fx.root, 'evil-hooks');
+    fs.mkdirSync(hooksDir);
+    fs.writeFileSync(path.join(hooksDir, 'post-checkout'), `#!/bin/sh\ntouch '${path.join(fx.root, 'RAN_hookspath')}'\n`, { mode: 0o755 });
+    git(['config', 'core.hooksPath', hooksDir], ws);
+    git(['config', 'core.fsmonitor', script('fsmon.sh', 'RAN_fsmon')], ws);
+    git(['config', 'remote.origin.uploadpack', `touch '${path.join(fx.root, 'RAN_uploadpack')}'; git-upload-pack`], ws);
+    git(['config', 'credential.helper', `!${script('cred.sh', 'RAN_cred')}`], ws);
+
+    fx.commit('main', 'n.txt', 'n');
+    await gs.sync('main');
+    assert.equal(read(fx, 'n.txt'), 'n');
+    const ran = fs.readdirSync(fx.root).filter((f) => f.startsWith('RAN_'));
+    assert.deepEqual(ran, []);
+  } finally { fx.cleanup(); }
+});
+
+test('buildGitEnv: GIT_ALLOW_PROTOCOL follows the repo kind', () => {
+  const proto = (repoUrl) => buildGitEnv({ baseEnv: {}, repoUrl }).GIT_ALLOW_PROTOCOL;
+  assert.equal(proto('https://h/o/r'), 'https');
+  assert.equal(proto('git@h:o/r'), 'ssh');
+  assert.equal(proto('ssh://git@h/o/r'), 'ssh');
+  assert.equal(proto('/x.git'), 'file');
+  assert.equal(proto('file:///x'), 'file');
+  assert.equal(proto('ext::x'), 'https:ssh:file');
+});
+
+test('buildGitEnv: inherited GIT_CONFIG_* entries are replaced, other GIT_CONFIG_* vars kept', () => {
+  const env = buildGitEnv({
+    baseEnv: {
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/evil', GIT_CONFIG_KEY_9: 'x',
+      GIT_CONFIG_PARAMETERS: "'a.b=c'", GIT_CONFIG_NOSYSTEM: '1',
+    },
+    repoUrl: '/x.git',
+  });
+  assert.equal(env.GIT_CONFIG_VALUE_0, '/dev/null');
+  assert.equal(env.GIT_CONFIG_COUNT, '4');
+  assert.equal('GIT_CONFIG_KEY_9' in env, false);
+  assert.equal('GIT_CONFIG_PARAMETERS' in env, false);
+  assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
 });

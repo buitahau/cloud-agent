@@ -76,7 +76,7 @@ export function isValidRepoId(id) {
 
 /**
  * Classify and sanity-check a git remote URL from the repos file.
- *  - "https"  https://host/path   (no user:pass@ — credentials come from auth.tokenEnv)
+ *  - "https"  https://host/path   (no user:pass@ — the token is stored separately)
  *  - "ssh"    ssh://[user@]host[:port]/path  or scp-style user@host:path
  *  - "local"  file:///abs/path or an absolute filesystem path (tests use bare repos on disk)
  * Rejects: empty / >2000 chars / whitespace or control chars / leading "-" / http:// /
@@ -96,7 +96,7 @@ export function validateRepoUrl(url) {
   if (/^https:\/\//i.test(url)) {
     let u;
     try { u = new URL(url); } catch { return { ok: false, error: 'url is not a valid https URL' }; }
-    if (u.username || u.password) return { ok: false, error: 'url must not embed credentials; use auth.tokenEnv' };
+    if (u.username || u.password) return { ok: false, error: 'url must not embed credentials; the token is stored separately' };
     if (!u.hostname || u.pathname.length <= 1) return { ok: false, error: 'url must include a host and a repository path' };
     return { ok: true, kind: 'https' };
   }

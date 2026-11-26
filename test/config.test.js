@@ -1,25 +1,19 @@
-// Covers: fail-fast config (prerequisite for T1, T6, T10) incl. the repos file. Pure unit tests — no processes.
+// Covers: fail-fast config (prerequisite for T1, T6, T10), env only (repos live in the DB). Pure unit tests — no processes.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig, ConfigError, expandHome, redactConfig } from '../src/config.js';
+import { deriveKeyId } from '../src/secrets.js';
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-'));
 after(() => fs.rmSync(cwd, { recursive: true, force: true }));
-const sshKey = path.join(cwd, 'id_test');
-fs.writeFileSync(sshKey, 'key');
 
-let fileNo = 0;
-/** Write a repos file into cwd and return its name (relative, like a user would set REPOS_FILE). */
-function reposFile(doc) {
-  const name = `repos-${++fileNo}.json`;
-  fs.writeFileSync(path.join(cwd, name), typeof doc === 'string' ? doc : JSON.stringify(doc));
-  return name;
-}
-const LOCAL = { repos: [{ id: 'local', url: '/tmp/origin.git' }] };
-const BASE = { REPOS_FILE: reposFile(LOCAL), API_KEY: 'k' };
+const B1 = crypto.randomBytes(32).toString('base64');
+const B2 = crypto.randomBytes(32).toString('base64');
+const BASE = { API_KEY: 'k', MASTER_KEY: B1 };
 
 function problemsOf(env) {
   try {
@@ -31,7 +25,7 @@ function problemsOf(env) {
   assert.fail('expected ConfigError');
 }
 
-test('minimal valid env (REPOS_FILE + API_KEY) -> defaults applied', () => {
+test('minimal valid env (API_KEY + MASTER_KEY) -> defaults applied', () => {
   const c = loadConfig(BASE, { cwd });
   assert.equal(c.apiKey, 'k');
   assert.equal(c.claudeBin, 'claude');
@@ -47,22 +41,23 @@ test('minimal valid env (REPOS_FILE + API_KEY) -> defaults applied', () => {
   assert.equal(c.jobRetentionMax, 1000);
   assert.equal(c.adminUser, 'admin');
   assert.equal(c.adminPassword, null);
+  assert.equal(c.dbFile, path.join(cwd, 'data', 'cloud-agent.db'));
   assert.equal(c.workspaceRoot, path.join(cwd, 'workspaces'));
-  assert.equal(c.repos.length, 1);
-  assert.deepEqual({ ...c.repos[0] }, {
-    id: 'local', url: '/tmp/origin.git', kind: 'local', defaultBranch: 'main',
-    workspaceDir: path.join(cwd, 'workspaces', 'local'), sshKeyPath: null, tokenEnv: null, token: null,
-  });
+  assert.equal(c.reposFile, path.join(cwd, 'repos.json'));
+  assert.equal(c.reposFileExplicit, false);
+  assert.equal(c.allowLocalRepos, false);
+  assert.equal(c.sshKeysDir, '/run/ssh-keys');
+  assert.equal(c.keyRing.currentKeyId, deriveKeyId(Buffer.from(B1, 'base64')));
+  assert.equal(c.keyRing.keyIds.length, 1);
+  assert.ok(!('repos' in c));
   assert.ok(Object.isFrozen(c));
-  assert.ok(Object.isFrozen(c.repos));
-  assert.ok(Object.isFrozen(c.repos[0]));
 });
 
-test('missing repos file and API_KEY -> one ConfigError listing both problems', () => {
+test('missing API_KEY and MASTER_KEY -> one ConfigError listing both problems', () => {
   const problems = problemsOf({});
   assert.equal(problems.length, 2);
-  assert.ok(problems.some((p) => p.includes('REPOS_FILE not found')));
-  assert.ok(problems.some((p) => p.includes('API_KEY')));
+  assert.ok(problems.some((p) => /API_KEY is required/.test(p)));
+  assert.ok(problems.some((p) => /MASTER_KEY is required/.test(p)));
 });
 
 test('empty / whitespace values count as unset', () => {
@@ -72,81 +67,45 @@ test('empty / whitespace values count as unset', () => {
   assert.equal(c.maxConcurrentJobs, 1);
 });
 
-test('repos file: multiple repos, each with its own credential; tokens read from the named env vars', () => {
-  const file = reposFile({
-    workspaceRoot: './ws',
-    repos: [
-      { id: 'web', url: 'https://github.com/org/web.git', defaultBranch: 'dev', auth: { tokenEnv: 'GIT_TOKEN_WEB' } },
-      { id: 'api', url: 'git@github.com:org/api.git', auth: { sshKeyPath: sshKey } },
-      { id: 'tools', url: 'ssh://git@github.com/org/tools.git', auth: { sshKeyPath: sshKey } },
-    ],
-  });
-  const c = loadConfig({ API_KEY: 'k', REPOS_FILE: file, GIT_TOKEN_WEB: 'ghp_web' }, { cwd });
-  assert.deepEqual(c.repos.map((r) => [r.id, r.kind, r.defaultBranch]), [['web', 'https', 'dev'], ['api', 'ssh', 'main'], ['tools', 'ssh', 'main']]);
-  assert.equal(c.repos[0].token, 'ghp_web');
-  assert.equal(c.repos[0].tokenEnv, 'GIT_TOKEN_WEB');
-  assert.equal(c.repos[1].sshKeyPath, sshKey);
-  assert.equal(c.repos[1].workspaceDir, path.join(cwd, 'ws', 'api'));
+test('MASTER_KEY: format, must differ from API_KEY, PREVIOUS without current, key ring of two', () => {
+  const short = crypto.randomBytes(31).toString('base64');
+  assert.ok(problemsOf({ ...BASE, MASTER_KEY: short }).some((p) => /MASTER_KEY must be base64/.test(p)));
+  assert.ok(problemsOf({ API_KEY: B1, MASTER_KEY: B1 }).some((p) => /MASTER_KEY must differ from API_KEY/.test(p)));
+  const p = problemsOf({ API_KEY: 'k', MASTER_KEY_PREVIOUS: B2 });
+  assert.ok(p.some((x) => /MASTER_KEY is required/.test(x)));
+  assert.ok(p.some((x) => /MASTER_KEY_PREVIOUS is set but MASTER_KEY is not/.test(x)));
+  const c = loadConfig({ ...BASE, MASTER_KEY_PREVIOUS: B2 }, { cwd });
+  assert.equal(c.keyRing.keyIds.length, 2);
+  assert.equal(c.keyRing.keyIds[1], deriveKeyId(Buffer.from(B2, 'base64')));
 });
 
-test('repos file: every remote repo must have its own credential; no global fallback', () => {
-  const file = reposFile({ repos: [
-    { id: 'web', url: 'https://github.com/org/web.git' },
-    { id: 'api', url: 'git@github.com:org/api.git' },
-    { id: 'mixed', url: 'https://github.com/org/m.git', auth: { tokenEnv: 'T_M', sshKeyPath: sshKey } },
-    { id: 'loc', url: '/srv/x.git', auth: { tokenEnv: 'T_M' } },
-  ] });
-  const problems = problemsOf({ API_KEY: 'k', REPOS_FILE: file, T_M: 'x' });
-  assert.ok(problems.some((p) => p.includes('"web"') && p.includes('set auth.tokenEnv')));
-  assert.ok(problems.some((p) => p.includes('"api"') && p.includes('set auth.sshKeyPath')));
-  assert.ok(problems.some((p) => p.includes('"mixed"') && p.includes('sshKeyPath only applies to ssh')));
-  assert.ok(problems.some((p) => p.includes('"loc"') && p.includes('local repos take no auth')));
-});
-
-test('repos file: bad ids, duplicates, bad urls, bad branch, missing token env var, missing key -> all listed', () => {
-  const file = reposFile({ repos: [
-    { id: 'Bad_Id', url: '/a.git' },
-    { id: 'admin', url: '/a.git' },
-    { id: 'dup', url: '/a.git' },
-    { id: 'dup', url: '/b.git' },
-    { id: 'rce', url: 'ext::sh' },
-    { id: 'creds', url: 'https://user:pass@github.com/o/r.git', auth: { tokenEnv: 'X' } },
-    { id: 'plain', url: 'http://github.com/o/r.git' },
-    { id: 'branch', url: '/a.git', defaultBranch: '--upload-pack=x' },
-    { id: 'notoken', url: 'https://github.com/o/r.git', auth: { tokenEnv: 'NOT_SET_ANYWHERE' } },
-    { id: 'nokey', url: 'git@github.com:o/r.git', auth: { sshKeyPath: '~/definitely-missing-key-xyz' } },
-  ] });
-  const problems = problemsOf({ API_KEY: 'k', REPOS_FILE: file, X: 'x' });
-  const has = (id, re) => assert.ok(problems.some((p) => p.includes(id) && re.test(p)), `${id} ${re}: ${problems.join(' | ')}`);
-  has('Bad_Id', /id must be/);
-  has('"admin"', /id must be/);
-  has('"dup"', /duplicate id/);
-  has('"rce"', /remote-helper/);
-  has('"creds"', /must not embed credentials/);
-  has('"plain"', /http:\/\/ is not allowed/);
-  has('"branch"', /defaultBranch/);
-  has('"notoken"', /NOT_SET_ANYWHERE \(auth.tokenEnv\) is not set/);
-  has('"nokey"', new RegExp(path.join(os.homedir(), 'definitely-missing-key-xyz').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-});
-
-test('repos file: invalid JSON / wrong shape / empty list', () => {
-  assert.match(problemsOf({ API_KEY: 'k', REPOS_FILE: reposFile('{ nope') })[0], /not valid JSON/);
-  assert.match(problemsOf({ API_KEY: 'k', REPOS_FILE: reposFile('[]') })[0], /JSON object/);
-  assert.match(problemsOf({ API_KEY: 'k', REPOS_FILE: reposFile({ repos: [] }) })[0], /non-empty array/);
-});
-
-test('repos file: workspaceRoot may not be the service dir or a parent of it', () => {
+test('WORKSPACE_ROOT may not be the service dir or a parent of it; relative resolved against cwd', () => {
   for (const root of ['.', '..', '/']) {
-    const problems = problemsOf({ API_KEY: 'k', REPOS_FILE: reposFile({ workspaceRoot: root, repos: LOCAL.repos }) });
-    assert.ok(problems.some((p) => p.includes('workspaceRoot must not be the service directory')), root);
+    const problems = problemsOf({ ...BASE, WORKSPACE_ROOT: root });
+    assert.ok(problems.some((p) => /WORKSPACE_ROOT must not be the service directory/.test(p)), root);
   }
+  assert.equal(loadConfig({ ...BASE, WORKSPACE_ROOT: './ws' }, { cwd }).workspaceRoot, path.join(cwd, 'ws'));
 });
 
-test('old single-repo env vars are rejected with a pointer to REPOS_FILE', () => {
-  const problems = problemsOf({ ...BASE, REPO_URL: '/x.git', GIT_TOKEN: 'ghp_old' });
+test('DB_FILE resolved against cwd and may not live inside WORKSPACE_ROOT', () => {
+  assert.ok(problemsOf({ ...BASE, DB_FILE: './workspaces/x.db' }).some((p) => /DB_FILE must not be inside WORKSPACE_ROOT/.test(p)));
+  assert.equal(loadConfig({ ...BASE, DB_FILE: './d/x.db' }, { cwd }).dbFile, path.join(cwd, 'd', 'x.db'));
+});
+
+test('ALLOW_LOCAL_REPOS, SSH_KEYS_DIR, REPOS_FILE', () => {
+  assert.equal(loadConfig({ ...BASE, ALLOW_LOCAL_REPOS: 'yes' }, { cwd }).allowLocalRepos, true);
+  assert.match(problemsOf({ ...BASE, ALLOW_LOCAL_REPOS: 'maybe' })[0], /ALLOW_LOCAL_REPOS/);
+  assert.equal(loadConfig({ ...BASE, SSH_KEYS_DIR: '~/keys' }, { cwd }).sshKeysDir, path.join(os.homedir(), 'keys'));
+  const c = loadConfig({ ...BASE, REPOS_FILE: 'missing.json' }, { cwd });
+  assert.equal(c.reposFile, path.join(cwd, 'missing.json'));
+  assert.equal(c.reposFileExplicit, true);
+});
+
+test('old single-repo env vars are rejected with a pointer to the database; GIT_TOKEN alone loads', () => {
+  const problems = problemsOf({ ...BASE, REPO_URL: '/x.git', GIT_SSH_KEY_PATH: '/k' });
   assert.equal(problems.length, 1);
-  assert.match(problems[0], /REPO_URL, GIT_TOKEN are no longer supported; define repos in REPOS_FILE/);
-  assert.ok(!problems[0].includes('ghp_old'));
+  assert.match(problems[0], /REPO_URL, GIT_SSH_KEY_PATH are no longer supported; repos are stored in the database/);
+  assert.equal(loadConfig({ ...BASE, GIT_TOKEN: 'ghp_old' }, { cwd }).apiKey, 'k');
 });
 
 test('MAX_CONCURRENT_JOBS, JOBS_FILE, JOB_RETENTION_MAX, ADMIN_* parsed and checked', () => {
@@ -163,29 +122,28 @@ test('MAX_CONCURRENT_JOBS, JOBS_FILE, JOB_RETENTION_MAX, ADMIN_* parsed and chec
 });
 
 test('ConfigError message never contains secret values', () => {
-  const file = reposFile({ repos: [{ id: 'web', url: 'https://github.com/o/r.git', auth: { tokenEnv: 'TOK' } }] });
-  const env = { API_KEY: 'secret-api-key-123', TOK: 'ghp_secret_token_456', ADMIN_PASSWORD: 'secret-api-key-123', REPOS_FILE: file, PORT: 'nope', CLAUDE_MAX_TURNS: 'x' };
+  const env = { API_KEY: 'secret-api-key-123', ADMIN_PASSWORD: 'secret-api-key-123', MASTER_KEY: 'not-a-valid-key-secret', MASTER_KEY_PREVIOUS: 'prev-secret-xyz', PORT: 'nope', CLAUDE_MAX_TURNS: 'x' };
   try {
     loadConfig(env, { cwd });
     assert.fail('expected ConfigError');
   } catch (err) {
     assert.ok(err instanceof ConfigError);
-    for (const secret of [env.API_KEY, env.TOK]) assert.ok(!err.message.includes(secret));
+    for (const secret of [env.API_KEY, env.MASTER_KEY, env.MASTER_KEY_PREVIOUS]) assert.ok(!err.message.includes(secret), secret);
   }
 });
 
-test('redactConfig masks the API key, admin password and every repo token', () => {
-  const file = reposFile({ repos: [{ id: 'web', url: 'https://github.com/o/r.git', auth: { tokenEnv: 'TOK' } }, ...LOCAL.repos] });
-  const c = loadConfig({ API_KEY: 'k', TOK: 'ghp_x', ADMIN_PASSWORD: 'admin-pw-123', REPOS_FILE: file }, { cwd });
+test('redactConfig masks the API key, admin password and master keys (key ids only)', () => {
+  const c = loadConfig({ ...BASE, ADMIN_PASSWORD: 'admin-pw-123', MASTER_KEY_PREVIOUS: B2 }, { cwd });
   const r = redactConfig(c);
   assert.equal(r.apiKey, '***');
   assert.equal(r.adminPassword, '***');
-  assert.equal(r.repos[0].token, '***');
-  assert.equal(r.repos[1].token, null);
-  assert.equal(r.repos[0].tokenEnv, 'TOK');
+  assert.match(String(r.masterKey), /^\*\*\* \(key id [0-9a-f]{16}\)$/);
+  assert.equal(r.masterKeyPrevious.length, 1);
+  assert.match(r.masterKeyPrevious[0], /^\*\*\* \(key id [0-9a-f]{16}\)$/);
+  assert.ok(!('keyRing' in r));
   const json = JSON.stringify(r);
-  for (const s of ['ghp_x', 'admin-pw-123']) assert.ok(!json.includes(s));
-  assert.equal(c.repos[0].token, 'ghp_x'); // original untouched
+  for (const s of [B1, B2, 'admin-pw-123']) assert.ok(!json.includes(s));
+  assert.equal(c.adminPassword, 'admin-pw-123'); // original untouched
 });
 
 test('JOB_TIMEOUT_SECONDS=10 -> jobTimeoutMs 10000 (T10 setup); "abc", "0", "1.5" rejected', () => {
@@ -218,10 +176,4 @@ test('expandHome: "~", "~/a", "/abs", "rel" ', () => {
   assert.equal(expandHome('/abs', '/home/u'), '/abs');
   assert.equal(expandHome('rel', '/home/u'), 'rel');
   assert.equal(expandHome('~other', '/home/u'), '~other');
-});
-
-test('a repo may use GIT_TOKEN as its own tokenEnv without tripping the legacy-var check', () => {
-  const file = reposFile({ repos: [{ id: 'web', url: 'https://github.com/o/r.git', auth: { tokenEnv: 'GIT_TOKEN' } }] });
-  const c = loadConfig({ API_KEY: 'k', REPOS_FILE: file, GIT_TOKEN: 'ghp_1' }, { cwd });
-  assert.equal(c.repos[0].token, 'ghp_1');
 });

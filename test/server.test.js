@@ -13,10 +13,12 @@ const KEY = 'test-key';
 const silent = { info() {}, warn() {}, error() {} };
 
 const REPOS = [
-  { id: 'web', url: '/srv/web.git', kind: 'local', defaultBranch: 'dev', workspaceDir: '/tmp/cloud-agent-test-nonexistent/web', sshKeyPath: null, tokenEnv: null, token: null },
-  { id: 'api', url: '/srv/api.git', kind: 'local', defaultBranch: 'main', workspaceDir: '/tmp/cloud-agent-test-nonexistent/api', sshKeyPath: null, tokenEnv: null, token: null },
+  { id: 'web', url: '/srv/web.git', kind: 'local', defaultBranch: 'dev', sshKeyPath: null, enabled: true },
+  { id: 'api', url: '/srv/api.git', kind: 'local', defaultBranch: 'main', sshKeyPath: null, enabled: true },
 ];
-const repos = () => createRepoRegistry(REPOS, { gitTimeoutMs: 1000 });
+const repos = () => createRepoRegistry({
+  repoStore: { list: () => REPOS, getToken: () => null }, workspaceRoot: '/tmp/cloud-agent-test-nonexistent', gitTimeoutMs: 1000,
+});
 const appFor = (store, extra = {}) => createApp({ config: { apiKey: KEY }, store, worker: { enqueue() {} }, repos: repos(), logger: silent, ...extra });
 
 async function withServer(fn, { worker } = {}) {

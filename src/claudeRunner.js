@@ -48,7 +48,7 @@ export const STRIPPED_ENV_VARS = Object.freeze([
  * @property {number}      [killGraceMs]          passed to run (tests use small values)
  * @property {import('./lib/processRunner.js').RunFn} [run=runProcess]
  * @property {NodeJS.ProcessEnv} [baseEnv=process.env]
- * @property {string[]} [secretEnvNames=[]]   env var names to hide from claude (repo tokenEnv names)
+ * @property {string[]} [secretEnvNames=[]]   env var names to hide from claude (token env var names from repos.json)
  */
 
 /**
@@ -159,7 +159,7 @@ export function buildClaudeArgs(p) {
  * Child env: baseEnv minus service secrets (withoutSecrets: API_KEY, ADMIN_PASSWORD, MASTER_KEY*, GIT_TOKEN*,
  * secretEnvNames) and minus STRIPPED_ENV_VARS (so the ~/.claude subscription login is used). Never mutates baseEnv.
  * @param {NodeJS.ProcessEnv} baseEnv
- * @param {Iterable<string>} [secretEnvNames=[]]  configured repos' auth.tokenEnv names
+ * @param {Iterable<string>} [secretEnvNames=[]]  token env var names from repos.json (may be arbitrary)
  * @returns {NodeJS.ProcessEnv}
  */
 export function buildClaudeEnv(baseEnv, secretEnvNames = []) {

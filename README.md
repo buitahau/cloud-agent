@@ -7,7 +7,7 @@ Several repos can be configured; a read-only admin dashboard at `/admin/` shows 
 
 Spec: [docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md). Design notes: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 Multi-repo + dashboard design: [docs/MULTI_REPO_PLAN.md](docs/MULTI_REPO_PLAN.md).
-Repos in SQLite + encrypted per-repo tokens (proposed): [docs/SQLITE_REPOS_PLAN.md](docs/SQLITE_REPOS_PLAN.md).
+Repos in SQLite + encrypted per-repo tokens: [docs/SQLITE_REPOS_PLAN.md](docs/SQLITE_REPOS_PLAN.md).
 
 ## Setup
 
@@ -22,20 +22,31 @@ claude auth status          # should show "authMethod": "claude.ai"
 # if not:  claude  → /login
 
 # 2. Configure
-cp .env.example .env              # API_KEY, ADMIN_PASSWORD, one GIT_TOKEN_<NAME> per https repo, ...
-cp repos.example.json repos.json  # the target repos
+openssl rand -base64 32           # → MASTER_KEY in .env
+cp .env.example .env              # MASTER_KEY, API_KEY, ADMIN_PASSWORD, one GIT_TOKEN_<NAME> per https repo, ...
+cp repos.example.json repos.json  # the target repos, imported once into the database on first start
 ```
 
-### Repos (`repos.json`, path set by `REPOS_FILE`)
+### Repos (stored in SQLite)
+
+Repos and their tokens live in a SQLite database, `DB_FILE` (default `./data/cloud-agent.db`, created with mode
+0600). Tokens are encrypted with `MASTER_KEY` (see [Master key, backups, rotation](#master-key-backups-rotation)).
+Repos are loaded once at startup.
+
+**First-boot import.** The database is filled once from `repos.json` (path set by `REPOS_FILE`, default
+`./repos.json`) plus the `GIT_TOKEN_<NAME>` env vars it names. The import runs only when the repos table is empty,
+the import has never run before, and the file exists. It is atomic (any problem imports nothing and startup fails
+with a list of every problem) and happens once: the log says `Imported N repos from <file>`. After that,
+`repos.json` and `GIT_TOKEN_*` are ignored and only produce a startup warning; remove them. With no database and no
+file, the service starts with 0 repos.
 
 ```json
 {
-  "workspaceRoot": "./workspaces",
   "repos": [
     { "id": "web", "url": "https://github.com/your-org/web.git", "defaultBranch": "dev",
       "auth": { "tokenEnv": "GIT_TOKEN_WEB" } },
     { "id": "api", "url": "git@github.com:your-org/api.git",
-      "auth": { "sshKeyPath": "~/.ssh/id_ed25519_api" } }
+      "auth": { "sshKeyPath": "/run/ssh-keys/id_ed25519_api" } }
   ]
 }
 ```
@@ -43,18 +54,25 @@ cp repos.example.json repos.json  # the target repos
 - `id`: 1–40 chars of `a-z`, `0-9`, `-`. It is the URL segment (`/web/run-agent`) and the workspace folder name.
   `admin`, `health`, `repos`, `run-agent` are reserved.
 - Every remote repo has **its own credential**, with no shared fallback: https URLs need `auth.tokenEnv` (the *name*
-  of an env var holding the token, so `repos.json` holds no secrets); ssh URLs need `auth.sshKeyPath`. Local paths
-  (`/srv/x.git`, `file:///...`) take none. The token is only sent to that repo's own host.
+  of an env var holding the token at import time); ssh URLs need `auth.sshKeyPath`, an absolute path inside
+  `SSH_KEYS_DIR` (default `/run/ssh-keys`; for local dev set `SSH_KEYS_DIR=~/.ssh`). Local paths (`/srv/x.git`,
+  `file:///...`) take none and are only allowed with `ALLOW_LOCAL_REPOS=true` (tests, local dev). The token is only
+  sent to that repo's own host.
 - `defaultBranch` (default `main`) is used when a job doesn't name a branch.
-- Each repo is cloned to `<workspaceRoot>/<id>` (default `./workspaces/<id>`) by its first job. If a workspace turns
-  out to be a clone of a different repo, its jobs fail with a "delete it so it is re-cloned" error.
-- Repos are loaded at startup; edit the file and restart to add/remove one. Startup fails with a list of every
-  problem in the file.
+- Each repo is cloned to `WORKSPACE_ROOT/<id>` (default `./workspaces/<id>`) by its first job. A `workspaceRoot` in
+  `repos.json` is ignored (with a warning if it differs; set `WORKSPACE_ROOT` to that path to keep existing clones).
+  If a workspace turns out to be a clone of a different repo, its jobs fail with a "delete it so it is re-cloned"
+  error.
+- Stored repos are re-checked at every startup: an invalid one (e.g. a local repo without `ALLOW_LOCAL_REPOS`) stops
+  the service; a missing ssh key file or a missing https token only warns (that repo's jobs fail).
+- **Until the admin write API ships, changing repos = re-import:** keep `repos.json` and its tokens, stop the
+  service, back up the database, move `cloud-agent.db*` aside, and start again.
 
-Migrating from the single-repo version: `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR`, `GIT_TOKEN` and
-`GIT_SSH_KEY_PATH` are no longer read (startup fails if they are set). Move the repo into `repos.json`, rename
-`GIT_TOKEN` to e.g. `GIT_TOKEN_<NAME>` and reference it from `auth.tokenEnv`. The old `./workspace` clone is not
-reused; delete it, since each repo is re-cloned under `./workspaces/<id>`.
+Migrating from the single-repo version: `REPO_URL`, `REPO_BRANCH`, `WORKSPACE_DIR` and `GIT_SSH_KEY_PATH` are no
+longer read (startup fails if they are set); a leftover `GIT_TOKEN` is ignored with a warning. Move the repo into
+`repos.json` with its token in e.g. `GIT_TOKEN_<NAME>` referenced from `auth.tokenEnv`, and let the first boot
+import it. The old `./workspace` clone is not reused; delete it, since each repo is re-cloned under
+`./workspaces/<id>`.
 
 No Claude token or API key is configured. The service uses the subscription login stored in `~/.claude` of
 the OS user that runs it, so start it as **that same user** (same `HOME`). `ANTHROPIC_API_KEY`,
@@ -64,6 +82,13 @@ login is always what gets used and billed. The service's own secrets (`API_KEY`,
 are also removed from the environment of claude and of git; git gets the repo's token only as an origin-scoped
 auth header, and always runs with `GIT_TRACE_REDACT=1`. This is not a sandbox: claude runs as the same OS user
 as the service.
+
+Repo tokens are encrypted at rest (AES-256-GCM, bound to the repo, the secret name and the repo URL's origin, so a
+row copied to another repo or a URL pointed at another host no longer decrypts). Git runs with hooks and fsmonitor
+disabled, credential helpers and askPass reset, only the repo's own transport allowed, and an explicit
+`--upload-pack`, so a `.git/config` planted in a workspace by a job can't make the next sync run code. Known limit:
+filter drivers and `http.*` overrides in a workspace's `.git/config` are not neutralised (same trust level as
+claude itself, which runs as the same user).
 
 At startup the service checks `claude --version`, `claude auth status` (must be logged in with
 `authMethod: "claude.ai"`), and (with `CLAUDE_AUTH_PROBE=true`,
@@ -89,6 +114,29 @@ Ctrl-C / SIGTERM shuts down gracefully: queued jobs are marked failed, running c
   was running"). Unset = in memory only. The live event timeline is not saved; status, result and log are.
 - `JOB_RETENTION_MAX` (default `1000`) finished jobs are kept; older ones are dropped. Queued/running jobs never are.
 
+### Master key, backups, rotation
+
+`MASTER_KEY` (base64 of 32 bytes: `openssl rand -base64 32`) is required; startup fails without it, and also fails
+(before the Claude probe) if a stored token can't be decrypted with `MASTER_KEY` / `MASTER_KEY_PREVIOUS`. Keep a copy
+of it **outside** your backups (e.g. a password manager): a backup plus its key is a full set of tokens, and losing
+the key means re-entering (re-importing) every token.
+
+Back up with the built-in command, which takes a consistent copy (a plain `cp` of a live WAL database can miss
+committed data). The target must not exist; it is written with mode 0600:
+
+```bash
+docker compose exec cloud-agent node src/cli.js backup /app/data/backups/$(date +%F).db   # Docker
+node src/cli.js backup ./data/backups/$(date +%F).db                                      # local (reads DB_FILE)
+```
+
+Rotate the key:
+
+1. Back up the database.
+2. Put the new key in `MASTER_KEY` and the old one in `MASTER_KEY_PREVIOUS` (comma-separated if several).
+3. Restart (`docker compose up -d`).
+4. Startup re-encrypts every token to the new key in one transaction and logs `Re-encrypted N secret(s) to key <kid>`.
+5. Remove `MASTER_KEY_PREVIOUS` (startup warns while it is set but unused) and restart.
+
 ## Deploy (Docker + VPS)
 
 ### How it fits together
@@ -100,11 +148,12 @@ attached when the container starts:
 | What | Where on the VPS | Container path | Who puts it there |
 |---|---|---|---|
 | `docker-compose.yml` | deploy dir (`/opt/cloud-agent`) | — | CI, on every deploy |
-| `.env` (secrets) | deploy dir | env vars | **you**, once |
-| `repos.json` | deploy dir (bind mount, read-only) | `/app/repos.json` | **you**, once |
+| `.env` (secrets, incl. `MASTER_KEY`) | deploy dir | env vars | **you**, once |
+| `repos.json` (first-boot import only) | deploy dir (bind mount, read-only) | `/app/repos.json` | **you**, once |
 | Claude login | volume `claude-home` | `/home/node` | **you**, once (`/login`) |
 | repo clones | volume `workspaces` | `/app/workspaces` | the app |
 | job history (`jobs.jsonl`) | volume `data` | `/app/data/jobs.jsonl` | the app |
+| repos + encrypted tokens (`cloud-agent.db`) | volume `data` | `/app/data/cloud-agent.db` | the app |
 
 So the same image runs anywhere, secrets never reach the registry, and redeploys keep the login and job history.
 Don't copy your local `jobs.jsonl` or `workspaces/` to the VPS: the app creates its own.
@@ -155,13 +204,12 @@ scp docker-compose.yml .env repos.json deploy@<vps>:/opt/cloud-agent/
 
 Inside the container, paths are container paths, not paths on your laptop. Check these before copying:
 
-- `.env`: `PORT`, `REPOS_FILE` and `JOBS_FILE` are overridden by `docker-compose.yml`, so their values don't matter.
-  Set real values for `API_KEY`, `ADMIN_PASSWORD` and every `GIT_TOKEN_<NAME>`.
-- `repos.json`: keep `"workspaceRoot": "./workspaces"` (it resolves to `/app/workspaces`, the volume). Any other
-  path puts clones in the container's own filesystem, which a redeploy wipes.
+- `.env`: `PORT`, `DB_FILE`, `WORKSPACE_ROOT`, `REPOS_FILE` and `JOBS_FILE` are overridden by `docker-compose.yml`,
+  so their values don't matter. Set real values for `MASTER_KEY`, `API_KEY`, `ADMIN_PASSWORD` and every
+  `GIT_TOKEN_<NAME>` (needed for the first-boot import only).
 - **ssh repos**: put the keys in `/opt/cloud-agent/ssh/` on the VPS, then uncomment the `./ssh:/run/ssh-keys:ro` line
   in `docker-compose.yml` and commit that change, since CI overwrites the VPS copy. Point
-  `"sshKeyPath"` at `/run/ssh-keys/<key>`. The container runs as uid 1000, so the keys must be readable by it:
+  `"sshKeyPath"` at `/run/ssh-keys/<key>` (keys must be under `/run/ssh-keys`, the default `SSH_KEYS_DIR`). The container runs as uid 1000, so the keys must be readable by it:
   ```bash
   sudo chown -R 1000:1000 /opt/cloud-agent/ssh && chmod 600 /opt/cloud-agent/ssh/*
   ```
@@ -191,6 +239,17 @@ echo <PAT> | docker login ghcr.io -u <github-user> --password-stdin
    curl -s localhost:8080/health
    ```
 
+### Upgrading to the SQLite repo store
+
+For a VPS that already runs a version reading `repos.json` + `GIT_TOKEN_*` directly:
+
+1. Add `MASTER_KEY` to `/opt/cloud-agent/.env` **before merging to `main`**; otherwise the new container exits with
+   `MASTER_KEY is required` and keeps restarting.
+2. Merge. Check `docker compose logs cloud-agent` for `Imported N repos from /app/repos.json`.
+3. Back up the database (see [Master key, backups, rotation](#master-key-backups-rotation)).
+4. Remove the `GIT_TOKEN_*` lines from `.env` and run `docker compose up -d`. Keep them until you are sure you won't
+   roll back: an older image ignores the database and reads `repos.json` + `GIT_TOKEN_*`.
+
 ### 5. Expose it with TLS
 
 The port is bound to `127.0.0.1:8080` only, so put a reverse proxy with TLS in front of it. Example with Caddy
@@ -214,7 +273,9 @@ Run these in `/opt/cloud-agent` on the VPS:
 | Task | Command |
 |---|---|
 | Deploy a new version | push/merge to `main` (CI does the rest) |
-| Add/change a repo | edit `repos.json`, then `docker compose restart cloud-agent` |
+| Add/change a repo | re-import: update `repos.json` + `GIT_TOKEN_*`, `docker compose stop`, back up, move `data/cloud-agent.db*` aside (`docker compose run --rm cloud-agent sh -c 'mkdir -p /app/data/old && mv /app/data/cloud-agent.db* /app/data/old/'`), `docker compose up -d` |
+| Back up repos + tokens | `docker compose exec cloud-agent node src/cli.js backup /app/data/backups/$(date +%F).db` (copy it off the VPS; keep `MASTER_KEY` separately) |
+| Rotate `MASTER_KEY` | new key in `MASTER_KEY`, old in `MASTER_KEY_PREVIOUS`, `docker compose up -d`, then remove `MASTER_KEY_PREVIOUS` (see above) |
 | Change `.env` | edit it, then `docker compose up -d` (`restart` does not re-read `.env`) |
 | Logs | `docker compose logs -f --tail 100 cloud-agent` |
 | Status | `docker compose ps` |
@@ -264,7 +325,7 @@ under `/admin/api/` (`summary`, `repos`, `repos/<id>`, `jobs?repo=&status=&limit
 
 ## API
 
-Every job route names the repo: `/<repo>/run-agent...`, where `<repo>` is an `id` from `repos.json`. All API
+Every job route names the repo: `/<repo>/run-agent...`, where `<repo>` is a repo `id` (see `GET /repos`). All API
 routes need the `x-api-key` header; `GET /health` is unauthenticated. Unknown repo → `404 {"error":"repo not found"}`.
 
 | Method | Path | |
@@ -340,7 +401,8 @@ npm test            # unit + integration: fake claude (test-support/fake-claude.
                     # No network, no real claude, no subscription usage.
 
 npm run test:e2e    # = E2E=1 node --test test/e2e.test.js
-                    # Starts the real service with the project's .env + repos.json and the REAL claude CLI (uses subscription).
+                    # Starts the real service with the project's .env and the REAL claude CLI (uses subscription);
+                    # repos.json + GIT_TOKEN_* are imported into a temp DB (MASTER_KEY from .env, or a random one).
 ```
 
 E2E knobs (env): `E2E_REPO=<id>` (default: first repo in `repos.json`), `E2E_BRANCHES=main,dev`,
