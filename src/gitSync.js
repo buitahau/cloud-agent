@@ -36,7 +36,7 @@ export class GitSyncError extends Error {
  * @property {string}      [gitBin='git']
  * @property {import('./lib/processRunner.js').RunFn} [run=runProcess]
  * @property {NodeJS.ProcessEnv} [baseEnv=process.env]
- * @property {string[]} [secretEnvNames=[]]  env var names to hide from git (token env var names from repos.json)
+ * @property {string[]} [secretEnvNames=[]]  env var names to hide from git (env vars holding a stored repo token)
  */
 
 /**

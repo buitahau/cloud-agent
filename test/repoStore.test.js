@@ -1,5 +1,5 @@
 // Covers: src/repoStore.js — repo rows, encrypted tokens (AAD binding, rotation), meta/audit, and the startup
-// helpers verifyAndRotateSecrets / checkStoredRepos. In-memory SQLite.
+// helpers verifyAndRotateSecrets / checkStoredRepos / findEnvVarsHoldingTokens. In-memory SQLite.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -9,7 +9,7 @@ import path from 'node:path';
 import { openDb, closeDb } from '../src/db.js';
 import { migrate } from '../src/db/migrations.js';
 import { createKeyRing, deriveKeyId, SecretDecryptError } from '../src/secrets.js';
-import { createRepoStore, verifyAndRotateSecrets, checkStoredRepos, SecretCheckError } from '../src/repoStore.js';
+import { createRepoStore, verifyAndRotateSecrets, checkStoredRepos, findEnvVarsHoldingTokens, SecretCheckError } from '../src/repoStore.js';
 
 const K1 = crypto.randomBytes(32);
 const K2 = crypto.randomBytes(32);
@@ -277,4 +277,16 @@ test('listAudit: newest first, id cursor, repo filter, parsed details', () => {
   assert.deepEqual(Object.keys(r.entries[0]).sort(), ['action', 'actor', 'at', 'details', 'id', 'ip', 'repo_id']);
   assert.equal(r.entries[0].ip, null);
   assert.deepEqual(store.listAudit().entries.length, 5);
+});
+
+test('findEnvVarsHoldingTokens: names (never values) of env vars equal to a stored token >= 8 chars, sorted', () => {
+  const { store } = fresh();
+  store.tx(() => {
+    store.insertRepo(https('web')); store.setToken('web', TOK);
+    store.insertRepo(https('short')); store.setToken('short', 'abc');
+    store.insertRepo({ id: 'loc', url: '/srv/x.git', kind: 'local', defaultBranch: 'main', sshKeyPath: null });
+  });
+  const env = { Z_PAT: ` ${TOK} `, A_PAT: TOK, NEAR: `${TOK}x`, SHORT: 'abc', UNSET: undefined };
+  assert.deepEqual(findEnvVarsHoldingTokens(store, env), [{ name: 'A_PAT', repoId: 'web' }, { name: 'Z_PAT', repoId: 'web' }]);
+  assert.deepEqual(findEnvVarsHoldingTokens(fresh().store, env), []);
 });

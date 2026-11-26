@@ -1,6 +1,6 @@
 // src/repoStore.js
 // Repos and their encrypted tokens in SQLite (tables from src/db/migrations.js), the audit log, plus the startup
-// helpers that verify/rotate stored secrets and re-validate stored repos. Write methods (insert/update/enable/
+// helpers that verify/rotate stored secrets, re-validate stored repos and find env vars holding a stored token. Write methods (insert/update/enable/
 // delete repos, set/delete tokens, audit rows) never open a transaction: callers wrap them in store.tx(fn) (tx()
 // cannot nest). Never puts token values in error messages or return values
 // other than getToken().
@@ -289,4 +289,27 @@ export function checkStoredRepos(store, { allowLocal, sshKeysDir }) {
     }
   }
   return { problems, warnings };
+}
+
+/**
+ * Startup: env vars whose (trimmed) value is a stored repo token, e.g. a custom auth.tokenEnv name left in .env
+ * from the repos.json era. Their names are hidden from claude and git. Tokens < 8 chars are not matched (false
+ * positives). Never returns or logs values. Call after verifyAndRotateSecrets.
+ * @param {Pick<RepoStore, 'list'|'getToken'>} store
+ * @param {Record<string, string|undefined>} env
+ * @returns {{ name: string, repoId: string }[]} sorted by name
+ */
+export function findEnvVarsHoldingTokens(store, env) {
+  const repoByToken = new Map();
+  for (const rec of store.list()) {
+    const t = store.getToken(rec.id);
+    if (t && t.length >= 8 && !repoByToken.has(t)) repoByToken.set(t, rec.id);
+  }
+  if (repoByToken.size === 0) return [];
+  const out = [];
+  for (const [name, v] of Object.entries(env)) {
+    const repoId = typeof v === 'string' ? repoByToken.get(v.trim()) : undefined;
+    if (repoId) out.push({ name, repoId });
+  }
+  return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }

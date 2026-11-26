@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FAKE_CLAUDE, createGitFixture } from '../test-support/gitFixture.js';
+import { runCli } from '../src/cli.js';
 
 const INDEX = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.js');
 const MK = crypto.randomBytes(32).toString('base64');
@@ -23,12 +24,16 @@ function cleanEnv(extra) {
 
 /**
  * Spawn src/index.js from a temp cwd. Resolves helpers to wait for output / exit.
- * repos: undefined -> two local repos; null -> no repos.json written.
+ * repos: undefined -> two local repos; null -> nothing. Repos are imported with `node src/cli.js import` (runCli) before
+ * the first start only (while cwd has no database). importEnv: extra env for that import only (token vars).
  */
-function startService(extraEnv, { cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-')), repos } = {}) {
-  if (repos !== null && !fs.existsSync(path.join(cwd, 'repos.json'))) {
+function startService(extraEnv, { cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-')), repos, importEnv = {} } = {}) {
+  if (repos !== null && !fs.existsSync(path.join(cwd, 'data', 'cloud-agent.db'))) {
     const doc = { repos: repos ?? [{ id: 'one', url: path.join(cwd, 'one.git') }, { id: 'two', url: path.join(cwd, 'two.git') }] };
     fs.writeFileSync(path.join(cwd, 'repos.json'), JSON.stringify(doc));
+    const err = [];
+    const code = runCli(['import', 'repos.json'], { env: { API_KEY: 'k', MASTER_KEY: MK, ALLOW_LOCAL_REPOS: 'true', ...importEnv }, cwd, out: () => {}, err: (m) => err.push(m) });
+    assert.equal(code, 0, err.join('\n'));
   }
   const child = spawn(process.execPath, [INDEX], {
     cwd,
@@ -101,15 +106,17 @@ test('T1 logged out (FAKE_CLAUDE_AUTH=logged_out) -> exits 1', async () => {
   } finally { s.cleanup(); }
 });
 
-test('empty database and no repos.json -> starts with 0 repos', async () => {
-  const s = startService({}, { repos: null });
+test('empty database -> starts with 0 repos; a repos.json in the cwd is not read', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-'));
+  fs.writeFileSync(path.join(cwd, 'repos.json'), JSON.stringify({ repos: [{ id: 'one', url: path.join(cwd, 'one.git') }] }));
+  const s = startService({}, { cwd, repos: null });
   try {
     await s.waitFor(/Repos: \(none\)/);
     const port = Number((await s.waitFor(/Listening on :(\d+)/))[1]);
     const r = await fetch(`http://127.0.0.1:${port}/repos`, { headers: { 'x-api-key': 'k' } });
     assert.deepEqual(await r.json(), []);
-    assert.match(s.err(), /no repos configured/);
-    assert.match(s.out(), /REPOS_FILE not found/);
+    assert.match(s.err(), /no repos configured .*node src\/cli\.js import/);
+    assert.doesNotMatch(s.out(), /Imported/);
     s.child.kill('SIGTERM');
     assert.equal((await s.withTimeout(10_000)).code, 0);
   } finally { s.child.kill('SIGKILL'); s.cleanup(); }
@@ -133,7 +140,7 @@ test('wrong MASTER_KEY fails before the Claude probe; MASTER_KEY_PREVIOUS rotate
   const TOKEN = 'ghp_startup_secret_1234';
   const K2 = crypto.randomBytes(32).toString('base64');
   const repos = [{ id: 'web', url: 'https://example.invalid/o/r.git', auth: { tokenEnv: 'GIT_TOKEN_WEB' } }];
-  const base = { CLAUDE_AUTH_PROBE: 'false', GIT_TOKEN_WEB: TOKEN };
+  const base = { CLAUDE_AUTH_PROBE: 'false' };
   const noSecrets = (s) => {
     for (const v of [TOKEN, MK, K2]) {
       assert.ok(!s.out().includes(v) && !s.err().includes(v), 'secret value in output');
@@ -141,8 +148,8 @@ test('wrong MASTER_KEY fails before the Claude probe; MASTER_KEY_PREVIOUS rotate
   };
   let s;
   try {
-    s = startService(base, { cwd, repos });
-    await s.waitFor(/Imported 1 repo from/);
+    s = startService(base, { cwd, repos, importEnv: { GIT_TOKEN_WEB: TOKEN } });
+    await s.waitFor(/Repos: web/);
     await s.waitFor(/Listening on :\d+/);
     s.child.kill('SIGTERM');
     assert.equal((await s.withTimeout(10_000)).code, 0);
@@ -160,7 +167,6 @@ test('wrong MASTER_KEY fails before the Claude probe; MASTER_KEY_PREVIOUS rotate
     await s.waitFor(/Listening on :\d+/);
     s.child.kill('SIGTERM');
     assert.equal((await s.withTimeout(10_000)).code, 0);
-    assert.match(s.err(), /GIT_TOKEN_WEB is ignored/);
     assert.match(s.err(), /MASTER_KEY_PREVIOUS is set but no stored secret uses it/);
     noSecrets(s);
 
@@ -172,13 +178,24 @@ test('wrong MASTER_KEY fails before the Claude probe; MASTER_KEY_PREVIOUS rotate
   } finally { s?.child.kill('SIGKILL'); fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test('invalid repos.json on first boot -> exits 1, nothing imported', async () => {
-  const s = startService({}, { repos: [{ id: 'web', url: 'https://example.invalid/o/r.git', auth: { tokenEnv: 'GIT_TOKEN_NOPE' } }] });
+test('leftover REPOS_FILE / GIT_TOKEN / GIT_TOKEN_* -> exits 1 at config time naming each, before the DB or claude', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-'));
+  const rec = path.join(cwd, 'rec.jsonl');
+  const s = startService({ REPOS_FILE: './repos.json', GIT_TOKEN: 'ghp_bare_leftover_1', GIT_TOKEN_WEB: 'ghp_web_leftover_1', FAKE_CLAUDE_RECORD: rec }, { cwd, repos: null });
   try {
     assert.equal((await s.withTimeout(10_000)).code, 1);
-    assert.match(s.err(), /Import of repos\.json failed/);
-    assert.match(s.err(), /GIT_TOKEN_NOPE \(auth.tokenEnv\) is not set/);
+    assert.match(s.err(), /GIT_TOKEN, GIT_TOKEN_WEB, REPOS_FILE are no longer read/);
+    assert.match(s.err(), /repos\.json mount/);
+    assert.match(s.err(), /node src\/cli\.js import <file>/);
+    assert.equal(fs.existsSync(rec), false);
+    assert.equal(fs.existsSync(path.join(cwd, 'data', 'cloud-agent.db')), false);
+    for (const v of ['ghp_bare_leftover_1', 'ghp_web_leftover_1']) assert.ok(!s.out().includes(v) && !s.err().includes(v));
   } finally { s.cleanup(); }
+  const s2 = startService({ GIT_TOKEN_WEB: 'x' }); // database already holds repos: still fatal
+  try {
+    assert.equal((await s2.withTimeout(10_000)).code, 1);
+    assert.match(s2.err(), /GIT_TOKEN_WEB is no longer read/);
+  } finally { s2.cleanup(); }
 });
 
 test('local repos need ALLOW_LOCAL_REPOS=true', async () => {
@@ -194,14 +211,13 @@ test('old REPO_URL setup -> exits 1 pointing at the database', async () => {
   try {
     const { code } = await s.withTimeout(10_000);
     assert.equal(code, 1);
-    assert.match(s.err(), /REPO_URL is no longer supported; repos are stored in the database/);
+    assert.match(s.err(), /REPO_URL is no longer read: repos and their tokens are stored in the database/);
   } finally { s.cleanup(); }
 });
 
 test('logs the configured repos and admin state; /admin is off without ADMIN_PASSWORD', async () => {
   const s = startService({ MAX_CONCURRENT_JOBS: '2' });
   try {
-    await s.waitFor(/Imported 2 repos from .*repos\.json/);
     await s.waitFor(/Repos: one, two \(max 2 concurrent jobs\)/);
     await s.waitFor(/Admin dashboard: disabled/);
     const port = Number((await s.waitFor(/Listening on :(\d+)/))[1]);
@@ -256,8 +272,7 @@ test('JOBS_FILE: finished jobs survive a restart (end to end with a real repo + 
     assert.deepEqual(repo.recent_jobs.map((j) => j.id), [id]);
     s.child.kill('SIGTERM');
     assert.equal((await s.withTimeout(10_000)).code, 0);
-    assert.match(s.err(), /REPOS_FILE .* is ignored/);
-    assert.doesNotMatch(s.out(), /Imported/);
+    assert.doesNotMatch(s.err(), /REPOS_FILE|GIT_TOKEN/);
   } finally { s.child.kill('SIGKILL'); s.cleanup(); fx.cleanup(); }
 });
 
@@ -272,25 +287,27 @@ test('CLAUDE_AUTH_PROBE=false -> starts with "probe skipped" even with an invali
   } finally { s.child.kill('SIGKILL'); s.cleanup(); }
 });
 
-test('claude never sees API_KEY, ADMIN_PASSWORD, MASTER_KEY or repo tokens', async () => {
+test('claude never sees API_KEY, ADMIN_PASSWORD, MASTER_KEY or an env var holding a repo token (warned)', async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'startup-'));
   const rec = path.join(cwd, 'rec.jsonl');
   const repos = [{ id: 'web', url: 'https://example.invalid/o/r.git', auth: { tokenEnv: 'MY_REPO_PAT' } }];
   const s = startService({
-    ADMIN_PASSWORD: 'admin-secret-pw', MASTER_KEY_PREVIOUS: crypto.randomBytes(32).toString('base64'), MY_REPO_PAT: 'pat-secret',
-    GIT_TOKEN_OLD: 'old', FAKE_CLAUDE_RECORD: rec,
-  }, { cwd, repos });
+    ADMIN_PASSWORD: 'admin-secret-pw', MASTER_KEY_PREVIOUS: crypto.randomBytes(32).toString('base64'), MY_REPO_PAT: 'pat-secret-1234',
+    FAKE_CLAUDE_RECORD: rec,
+  }, { cwd, repos, importEnv: { MY_REPO_PAT: 'pat-secret-1234' } });
   try {
     await s.waitFor(/Claude auth OK/);
     await s.waitFor(/Listening on :\d+/);   // signal handlers are installed by then
     const entries = fs.readFileSync(rec, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
     assert.ok(entries.length >= 2, `expected auth status + probe records, got ${entries.length}`);
     for (const e of entries) {
-      for (const k of ['API_KEY', 'ADMIN_PASSWORD', 'MASTER_KEY', 'MASTER_KEY_PREVIOUS', 'MY_REPO_PAT', 'GIT_TOKEN_OLD']) {
+      for (const k of ['API_KEY', 'ADMIN_PASSWORD', 'MASTER_KEY', 'MASTER_KEY_PREVIOUS', 'MY_REPO_PAT']) {
         assert.ok(!e.envKeys.includes(k), `${k} reached claude (${e.argv.join(' ')})`);
       }
     }
     assert.ok(!s.out().includes('pat-secret'), 'repo token leaked into logs');
+    assert.match(s.err(), /WARNING: MY_REPO_PAT holds the token of repo "web"/);
+    assert.ok(!s.err().includes('pat-secret-1234'));
     s.child.kill('SIGTERM');
     assert.equal((await s.withTimeout(10_000)).code, 0);
   } finally { s.child.kill('SIGKILL'); s.cleanup(); }

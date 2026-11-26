@@ -53,7 +53,7 @@ export class ClaudeAuthError extends Error {
  * @param {boolean}     [opts.probe=true]
  * @param {import('./lib/processRunner.js').RunFn} [opts.run=runProcess]
  * @param {NodeJS.ProcessEnv} [opts.baseEnv=process.env]
- * @param {string[]} [opts.secretEnvNames=[]]  token env var names from repos.json, hidden from claude
+ * @param {string[]} [opts.secretEnvNames=[]]  env vars holding a stored repo token, hidden from claude
  * @returns {Promise<AuthCheckResult>}
  * @throws {ClaudeAuthError}
  */

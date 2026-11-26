@@ -37,7 +37,7 @@ flowchart LR
     Worker --> Runner
     Git --> Proc
     Runner --> Proc
-    Git -->|git| Origin[(Origin repos<br/>from REPOS_FILE)]
+    Git -->|git| Origin[(Origin repos<br/>from the repo DB)]
     Git --> WS[("workspaces/&lt;id&gt;<br/>one clone per repo")]
     Proc -->|"claude -p ... (cwd = repo workspace)"| CLI["claude CLI<br/>machine login"]
     CLI --> WS
@@ -46,7 +46,7 @@ flowchart LR
 | Module | Responsibility |
 |---|---|
 | `src/index.js` | Load config, check Claude login, load the jobs file, wire modules, listen, graceful shutdown. |
-| `src/config.js` | Parse and validate env and the repos file (`REPOS_FILE`): ids, URLs, per-repo credentials, workspace paths. |
+| `src/config.js` | Parse and validate env (fail fast; retired repos.json-era vars rejected). |
 | `src/repoRegistry.js` | The configured repos, one `gitSync` each; repo health/status derived from job history. |
 | `src/server.js` | API routes (`/repos`, `/<repo>/run-agent...`), `x-api-key` auth, `createSseHandler` (shared with admin), `closeStreams`. |
 | `src/admin.js` + `web/` | Read-only dashboard (React + Ant Design app built into `web/dist`) and its JSON API, behind HTTP Basic auth. |
@@ -153,7 +153,7 @@ flowchart LR
 
 ## Configuration
 
-See `.env.example` and `repos.example.json`. Relevant to this flow: `REPOS_FILE` (repos, per-repo
-`auth.tokenEnv` / `auth.sshKeyPath`, `workspaceRoot`), the `GIT_TOKEN_*` vars it references,
+See `.env.example`. Repos and their encrypted tokens live in `DB_FILE` (admin API/dashboard, or
+`node src/cli.js import`); `MASTER_KEY`, `WORKSPACE_ROOT`, `SSH_KEYS_DIR`, `ALLOW_LOCAL_REPOS`,
 `MAX_CONCURRENT_JOBS`, `JOBS_FILE`, `JOB_RETENTION_MAX`, `ADMIN_USER` / `ADMIN_PASSWORD`,
 `CLAUDE_PERMISSION_MODE`, `CLAUDE_MAX_TURNS`, `JOB_TIMEOUT_SECONDS`, `PORT`, `API_KEY`.

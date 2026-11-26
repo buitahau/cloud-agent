@@ -1,7 +1,7 @@
 # Cloud Agent v1 — Project Overview
 
 > This is the original single-repo spec. The service has since been extended to several repos
-> (`POST /<repo>/run-agent`, repos defined in `REPOS_FILE`) and an admin dashboard; see
+> (`POST /<repo>/run-agent`, repos stored in SQLite, see [SQLITE_REPOS_PLAN.md](SQLITE_REPOS_PLAN.md)) and an admin dashboard; see
 > [MULTI_REPO_PLAN.md](MULTI_REPO_PLAN.md) and the [README](../README.md) for the current API and configuration.
 
 ## 1. Purpose

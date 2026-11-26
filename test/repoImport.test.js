@@ -1,5 +1,5 @@
-// Covers: src/repoImport.js — the one-time repos.json + GIT_TOKEN_* import into an empty database (atomic,
-// once), loadReposFile validation (ported from the old config.js tests) and collectTokenEnvNames.
+// Covers: src/repoImport.js — importReposFile (empty database only, atomic) and loadReposFile validation
+// (ported from the old config.js tests).
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -10,7 +10,7 @@ import { openDb, closeDb } from '../src/db.js';
 import { migrate } from '../src/db/migrations.js';
 import { createKeyRing } from '../src/secrets.js';
 import { createRepoStore } from '../src/repoStore.js';
-import { importReposJson, loadReposFile, collectTokenEnvNames, ImportError, META_IMPORTED } from '../src/repoImport.js';
+import { importReposFile, loadReposFile, ImportError, META_IMPORTED } from '../src/repoImport.js';
 
 const K1 = crypto.randomBytes(32);
 const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'imp-')));
@@ -23,7 +23,7 @@ after(() => dbs.forEach((db) => closeDb(db)));
 
 let fileNo = 0;
 /** Write a repos file into cwd and return its absolute path. */
-function reposFile(doc) {
+function writeRepos(doc) {
   const file = path.join(cwd, `repos-${++fileNo}.json`);
   fs.writeFileSync(file, typeof doc === 'string' ? doc : JSON.stringify(doc));
   return file;
@@ -34,11 +34,10 @@ function setup(file) {
   dbs.push(db);
   migrate(db);
   const store = createRepoStore({ db, keyRing: createKeyRing(K1) });
-  const config = { reposFile: file, workspaceRoot: path.join(cwd, 'workspaces'), allowLocalRepos: true, sshKeysDir: cwd };
-  const info = [];
+  const config = { workspaceRoot: path.join(cwd, 'workspaces'), allowLocalRepos: true, sshKeysDir: cwd };
   const warn = [];
-  const log = { info: (m) => info.push(m), warn: (m) => warn.push(m) };
-  return { db, store, config, info, warn, log };
+  const log = { warn: (m) => warn.push(m) };
+  return { db, store, config, file, warn, log };
 }
 const counts = (db) => ({
   repos: db.prepare('SELECT COUNT(*) AS n FROM repos').get().n,
@@ -55,10 +54,10 @@ const THREE = {
   ],
 };
 
-test('imports https + ssh + local repos with encrypted token, meta flag and one audit row', () => {
-  const t = setup(reposFile(THREE));
-  const r = importReposJson({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd });
-  assert.deepEqual(r, { status: 'imported', count: 3, ids: ['web', 'api', 'loc'], tokenEnvNames: ['GIT_TOKEN_WEB'] });
+test('imports https + ssh + local repos with encrypted token, meta flag and one audit row; refuses a non-empty DB', () => {
+  const t = setup(writeRepos(THREE));
+  const r = importReposFile({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd });
+  assert.deepEqual(r, { count: 3, ids: ['web', 'api', 'loc'] });
   assert.deepEqual(t.store.list().map((x) => [x.id, x.kind, x.defaultBranch]), [['web', 'https', 'dev'], ['api', 'ssh', 'main'], ['loc', 'local', 'main']]);
   assert.equal(t.store.get('api').sshKeyPath, sshKey);
   assert.equal(t.store.getToken('web'), WEB_TOKEN);
@@ -67,33 +66,31 @@ test('imports https + ssh + local repos with encrypted token, meta flag and one 
   const audits = t.db.prepare('SELECT * FROM audit_log').all();
   assert.equal(audits.length, 1);
   assert.equal(audits[0].action, 'import');
-  assert.equal(audits[0].actor, 'system');
+  assert.equal(audits[0].actor, 'cli');
   assert.ok(audits[0].details.includes('set …7890'));
   assert.ok(!audits[0].details.includes(WEB_TOKEN));
   for (const row of t.db.prepare('SELECT ciphertext FROM repo_secrets').all()) assert.ok(!Buffer.from(row.ciphertext).includes(WEB_TOKEN));
-  assert.equal(t.info.length, 1);
-  assert.match(t.info[0], /Imported 3 repos from .*; you can now remove REPOS_FILE/);
   assert.deepEqual(t.warn, []);
 
-  // 2. second call: skipped, nothing changes
+  // 2. second call: refused (database not empty), nothing changes
   const before = counts(t.db);
-  assert.deepEqual(importReposJson({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd }), { status: 'skipped', reason: 'db-not-empty', tokenEnvNames: ['GIT_TOKEN_WEB'] });
+  assert.throws(() => importReposFile({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd }),
+    (e) => e instanceof ImportError && /already has 3 repos; import only fills an empty database/.test(e.message));
   assert.deepEqual(counts(t.db), before);
 
-  // 3. emptied table but the meta flag is set: never re-imported
+  // 3. emptied table: the explicit command is not gated by the meta flag, so it imports again
   t.db.exec('DELETE FROM repos');
-  const r3 = importReposJson({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd });
-  assert.equal(r3.status, 'skipped');
-  assert.equal(r3.reason, 'already-imported');
-  assert.equal(t.store.count(), 0);
+  assert.deepEqual(importReposFile({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd }), { count: 3, ids: ['web', 'api', 'loc'] });
+  assert.notEqual(t.store.getMeta(META_IMPORTED), null);
+  assert.equal(t.db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n, 2);
 });
 
 test('atomic: an invalid repo imports nothing', () => {
-  const t = setup(reposFile({ repos: [
+  const t = setup(writeRepos({ repos: [
     { id: 'ok', url: '/srv/ok.git' },
     { id: 'web', url: 'https://github.com/o/web.git', auth: { tokenEnv: 'GIT_TOKEN_NOPE' } },
   ] }));
-  assert.throws(() => importReposJson({ ...t, env: {}, cwd }), (err) => err instanceof ImportError
+  assert.throws(() => importReposFile({ ...t, env: {}, cwd }), (err) => err instanceof ImportError
     && err.problems.some((p) => /GIT_TOKEN_NOPE \(auth.tokenEnv\) is not set/.test(p))
     && /Import of repos\.json failed \(nothing was imported\)/.test(err.message));
   assert.deepEqual(counts(t.db), { repos: 0, secrets: 0, audit: 0 });
@@ -101,7 +98,7 @@ test('atomic: an invalid repo imports nothing', () => {
 });
 
 test('atomic: a failing write rolls back the whole import', () => {
-  const t = setup(reposFile({ repos: [
+  const t = setup(writeRepos({ repos: [
     { id: 'a', url: 'https://github.com/o/a.git', auth: { tokenEnv: 'GIT_TOKEN_A' } },
     { id: 'b', url: 'https://github.com/o/b.git', auth: { tokenEnv: 'GIT_TOKEN_B' } },
   ] }));
@@ -111,48 +108,45 @@ test('atomic: a failing write rolls back the whole import', () => {
     if (++calls === 2) throw new Error('disk on fire');
     return orig(id, tok);
   };
-  assert.throws(() => importReposJson({ ...t, env: { GIT_TOKEN_A: 'tok-a-123456', GIT_TOKEN_B: 'tok-b-123456' }, cwd }), /disk on fire/);
+  assert.throws(() => importReposFile({ ...t, env: { GIT_TOKEN_A: 'tok-a-123456', GIT_TOKEN_B: 'tok-b-123456' }, cwd }), /disk on fire/);
   assert.deepEqual(counts(t.db), { repos: 0, secrets: 0, audit: 0 });
   assert.equal(t.store.getMeta(META_IMPORTED), null);
 });
 
-test('non-empty database: skipped, tokenEnvNames still read from the file', () => {
-  const t = setup(reposFile(THREE));
+test('non-empty database: refused, nothing changes', () => {
+  const t = setup(writeRepos(THREE));
   t.store.insertRepo({ id: 'x', url: '/x.git', kind: 'local', defaultBranch: 'main', sshKeyPath: null });
-  assert.deepEqual(importReposJson({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd }), { status: 'skipped', reason: 'db-not-empty', tokenEnvNames: ['GIT_TOKEN_WEB'] });
+  assert.throws(() => importReposFile({ ...t, env: { GIT_TOKEN_WEB: WEB_TOKEN }, cwd }), (e) => e instanceof ImportError && /already has 1 repo;/.test(e.message));
   assert.deepEqual(t.store.list().map((r) => r.id), ['x']);
 });
 
-test('missing file / directory -> no-file; bad JSON / shape -> ImportError; empty list is a valid import', () => {
+test('missing file / directory -> not found; bad JSON / shape -> ImportError; empty list is a valid import', () => {
   const missing = path.join(cwd, 'nope.json');
   const t = setup(missing);
-  assert.deepEqual(importReposJson({ ...t, env: {}, cwd }), { status: 'skipped', reason: 'no-file', tokenEnvNames: [] });
-  assert.ok(t.info[0].includes(missing));
-  assert.match(t.info[0], /REPOS_FILE not found/);
+  assert.throws(() => importReposFile({ ...t, env: {}, cwd }), (e) => e instanceof ImportError && e.problems[0] === `${missing} not found`);
   assert.equal(t.store.getMeta(META_IMPORTED), null);
 
   const dir = path.join(cwd, 'dir.json');
   fs.mkdirSync(dir);
-  assert.equal(importReposJson({ ...setup(dir), env: {}, cwd }).reason, 'no-file');
+  assert.throws(() => importReposFile({ ...setup(dir), env: {}, cwd }), /not found/);
 
-  assert.throws(() => importReposJson({ ...setup(reposFile('{ nope')), env: {}, cwd }), (e) => e instanceof ImportError && /not valid JSON/.test(e.problems[0]));
-  assert.throws(() => importReposJson({ ...setup(reposFile('[]')), env: {}, cwd }), (e) => e instanceof ImportError && /JSON object/.test(e.problems[0]));
-  assert.throws(() => importReposJson({ ...setup(reposFile({ repos: {} })), env: {}, cwd }), (e) => /"repos" must be an array/.test(e.problems[0]));
+  assert.throws(() => importReposFile({ ...setup(writeRepos('{ nope')), env: {}, cwd }), (e) => e instanceof ImportError && /not valid JSON/.test(e.problems[0]));
+  assert.throws(() => importReposFile({ ...setup(writeRepos('[]')), env: {}, cwd }), (e) => e instanceof ImportError && /JSON object/.test(e.problems[0]));
+  assert.throws(() => importReposFile({ ...setup(writeRepos({ repos: {} })), env: {}, cwd }), (e) => /"repos" must be an array/.test(e.problems[0]));
 
-  const e = setup(reposFile({ repos: [] }));
-  assert.deepEqual(importReposJson({ ...e, env: {}, cwd }), { status: 'imported', count: 0, ids: [], tokenEnvNames: [] });
+  const e = setup(writeRepos({ repos: [] }));
+  assert.deepEqual(importReposFile({ ...e, env: {}, cwd }), { count: 0, ids: [] });
   assert.notEqual(e.store.getMeta(META_IMPORTED), null);
-  assert.match(e.info[0], /Imported 0 repos/);
 });
 
 test('repos.json workspaceRoot is ignored with a warning when it differs from WORKSPACE_ROOT', () => {
-  const a = setup(reposFile({ workspaceRoot: './old', repos: [] }));
-  importReposJson({ ...a, env: {}, cwd });
+  const a = setup(writeRepos({ workspaceRoot: './old', repos: [] }));
+  importReposFile({ ...a, env: {}, cwd });
   assert.equal(a.warn.length, 1);
   assert.match(a.warn[0], /workspaceRoot .* is ignored; .*WORKSPACE_ROOT=/);
   assert.ok(a.warn[0].includes(path.join(cwd, 'old')));
-  const b = setup(reposFile({ workspaceRoot: './workspaces', repos: [] }));
-  importReposJson({ ...b, env: {}, cwd });
+  const b = setup(writeRepos({ workspaceRoot: './workspaces', repos: [] }));
+  importReposFile({ ...b, env: {}, cwd });
   assert.deepEqual(b.warn, []);
 });
 
@@ -161,7 +155,7 @@ test('repos.json workspaceRoot is ignored with a warning when it differs from WO
 const OPTS = { cwd, allowLocal: true, sshKeysDir: null };
 
 test('loadReposFile: multiple repos, each with its own credential; tokens read from the named env vars', () => {
-  const f = loadReposFile(reposFile({
+  const f = loadReposFile(writeRepos({
     workspaceRoot: './ws',
     repos: [
       { id: 'web', url: 'https://github.com/org/web.git', defaultBranch: 'dev', auth: { tokenEnv: 'GIT_TOKEN_WEB' } },
@@ -181,7 +175,7 @@ test('loadReposFile: multiple repos, each with its own credential; tokens read f
 });
 
 test('loadReposFile: every remote repo must have its own credential; no global fallback', () => {
-  const { problems } = loadReposFile(reposFile({ repos: [
+  const { problems } = loadReposFile(writeRepos({ repos: [
     { id: 'web', url: 'https://github.com/org/web.git' },
     { id: 'api', url: 'git@github.com:org/api.git' },
     { id: 'mixed', url: 'https://github.com/org/m.git', auth: { tokenEnv: 'T_M', sshKeyPath: sshKey } },
@@ -194,7 +188,7 @@ test('loadReposFile: every remote repo must have its own credential; no global f
 });
 
 test('loadReposFile: bad ids, duplicates, bad urls, bad branch, missing token env var, missing key -> all listed', () => {
-  const { problems, repos } = loadReposFile(reposFile({ repos: [
+  const { problems, repos } = loadReposFile(writeRepos({ repos: [
     { id: 'Bad_Id', url: '/a.git' },
     { id: 'admin', url: '/a.git' },
     { id: 'dup', url: '/a.git' },
@@ -222,12 +216,12 @@ test('loadReposFile: bad ids, duplicates, bad urls, bad branch, missing token en
 });
 
 test('loadReposFile: ALLOW_LOCAL_REPOS, SSH_KEYS_DIR, token format; problems never contain token values', () => {
-  const local = loadReposFile(reposFile({ repos: [{ id: 'loc', url: '/srv/x.git' }] }), {}, { ...OPTS, allowLocal: false });
+  const local = loadReposFile(writeRepos({ repos: [{ id: 'loc', url: '/srv/x.git' }] }), {}, { ...OPTS, allowLocal: false });
   assert.match(local.problems[0], /ALLOW_LOCAL_REPOS/);
-  const outside = loadReposFile(reposFile({ repos: [{ id: 'api', url: 'git@h:o/r', auth: { sshKeyPath: sshKey } }] }), {}, { ...OPTS, sshKeysDir: path.join(cwd, 'keys') });
+  const outside = loadReposFile(writeRepos({ repos: [{ id: 'api', url: 'git@h:o/r', auth: { sshKeyPath: sshKey } }] }), {}, { ...OPTS, sshKeysDir: path.join(cwd, 'keys') });
   assert.match(outside.problems[0], /auth\.sshKeyPath must be inside SSH_KEYS_DIR/);
   const env = { T_BAD: 'ghp_bad value', T_LONG: 'y'.repeat(1001) };
-  const tok = loadReposFile(reposFile({ repos: [
+  const tok = loadReposFile(writeRepos({ repos: [
     { id: 'a', url: 'https://github.com/o/a.git', auth: { tokenEnv: 'T_BAD' } },
     { id: 'b', url: 'https://github.com/o/b.git', auth: { tokenEnv: 'T_LONG' } },
   ] }), env, OPTS);
@@ -239,17 +233,7 @@ test('loadReposFile: ALLOW_LOCAL_REPOS, SSH_KEYS_DIR, token format; problems nev
 });
 
 test('loadReposFile: GIT_TOKEN may be used as a tokenEnv', () => {
-  const f = loadReposFile(reposFile({ repos: [{ id: 'web', url: 'https://github.com/o/r.git', auth: { tokenEnv: 'GIT_TOKEN' } }] }), { GIT_TOKEN: 'ghp_1' }, OPTS);
+  const f = loadReposFile(writeRepos({ repos: [{ id: 'web', url: 'https://github.com/o/r.git', auth: { tokenEnv: 'GIT_TOKEN' } }] }), { GIT_TOKEN: 'ghp_1' }, OPTS);
   assert.deepEqual(f.problems, []);
   assert.equal(f.repos[0].token, 'ghp_1');
-});
-
-test('collectTokenEnvNames: best effort, valid names only, deduped', () => {
-  assert.deepEqual(collectTokenEnvNames(path.join(cwd, 'missing.json')), []);
-  assert.deepEqual(collectTokenEnvNames(reposFile('{ nope')), []);
-  assert.deepEqual(collectTokenEnvNames(reposFile({ repos: 'x' })), []);
-  assert.deepEqual(collectTokenEnvNames(reposFile({ repos: [
-    { auth: { tokenEnv: 'MY_PAT' } }, { auth: { tokenEnv: 'MY_PAT' } }, { auth: { tokenEnv: 'bad name' } },
-    null, { auth: { tokenEnv: 5 } }, { id: 'x' }, { auth: { tokenEnv: 'GIT_TOKEN_X' } },
-  ] })), ['MY_PAT', 'GIT_TOKEN_X']);
 });
