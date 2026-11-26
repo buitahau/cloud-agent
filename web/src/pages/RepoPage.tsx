@@ -1,10 +1,19 @@
-import { BranchesOutlined, CheckCircleOutlined, CloudSyncOutlined, FolderOutlined, PlayCircleOutlined, WarningOutlined } from '@ant-design/icons';
-import { Alert, Col, Row, Skeleton, theme, Tooltip } from 'antd';
+import {
+  BranchesOutlined, CheckCircleOutlined, CloudSyncOutlined, DeleteOutlined, EditOutlined, FolderOutlined, KeyOutlined,
+  PlayCircleOutlined, WarningOutlined,
+} from '@ant-design/icons';
+import { Alert, Button, Col, Row, Skeleton, Tabs, theme, Tooltip } from 'antd';
+import { useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { useRepo } from '../api/queries';
+import { AuditLog } from '../components/AuditLog';
 import { JobsTable } from '../components/JobsTable';
 import { QueryError } from '../components/QueryError';
-import { HealthTag } from '../components/StatusTag';
+import { DeleteRepoModal, EnabledSwitch } from '../components/RepoActions';
+import { AuthInfo } from '../components/RepoAuth';
+import { RepoFormModal } from '../components/RepoForm';
+import { DisabledTag, HealthTag } from '../components/StatusTag';
+import { TokenModal } from '../components/TokenModal';
 import { CopyButton, PageHeader, Panel, StatTile, StatusDistribution, TimeAgo } from '../components/ui';
 import { dur, shortId } from '../lib/format';
 
@@ -12,6 +21,8 @@ export function RepoPage() {
   const { id = '' } = useParams();
   const { token } = theme.useToken();
   const repo = useRepo(id);
+  const [dialog, setDialog] = useState<null | 'edit' | 'token' | 'delete'>(null);
+  const [tab, setTab] = useState('jobs');
 
   if (repo.error) return <QueryError error={repo.error} what={`Repository "${id}"`} />;
   if (!repo.data) return <Skeleton active paragraph={{ rows: 6 }} />;
@@ -26,14 +37,45 @@ export function RepoPage() {
     <>
       <PageHeader
         crumbs={[{ to: '/', label: 'Overview' }, { label: 'Repositories' }, { label: r.id }]}
-        title={<>{r.id} <HealthTag health={r.health} large /></>}
+        title={<>{r.id} {!r.enabled && <DisabledTag large />} <HealthTag health={r.health} large /></>}
         sub={
           <>
             <span className="mono">{r.url_display}<CopyButton text={r.url_display} label="Copy repo URL" /></span>
             <span><BranchesOutlined /> default {r.default_branch}</span>
+            <AuthInfo auth={r.auth} />
+          </>
+        }
+        extra={
+          <>
+            <EnabledSwitch repo={r} />
+            {r.auth.kind === 'https' && (
+              <Button icon={<KeyOutlined />} onClick={() => setDialog('token')}>{r.auth.token ? 'Replace token' : 'Set token'}</Button>
+            )}
+            <Button icon={<EditOutlined />} onClick={() => setDialog('edit')}>Edit</Button>
+            <Button danger icon={<DeleteOutlined />} onClick={() => setDialog('delete')}>Delete</Button>
           </>
         }
       />
+
+      {!r.enabled && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          title="This repository is disabled"
+          description="New jobs are refused (409) and queued jobs fail. A running job finishes normally."
+        />
+      )}
+      {r.auth.kind === 'https' && !r.auth.token && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          title="No token stored"
+          description="Syncs of this https repo fail until a token is set."
+          action={<Button size="small" onClick={() => setDialog('token')}>Set token</Button>}
+        />
+      )}
 
       {ls && !ls.ok && (
         <Alert
@@ -103,8 +145,19 @@ export function RepoPage() {
         <StatusDistribution counts={c} />
       </Panel>
 
-      <h2 className="section-title">Jobs</h2>
-      <JobsTable fixedRepo={r.id} />
+      <Tabs
+        style={{ marginTop: 16 }}
+        activeKey={tab}
+        onChange={setTab}
+        items={[
+          { key: 'jobs', label: 'Jobs', children: <JobsTable fixedRepo={r.id} /> },
+          { key: 'audit', label: 'Audit', children: <AuditLog repo={r.id} /> },
+        ]}
+      />
+
+      <RepoFormModal mode="edit" repo={r} open={dialog === 'edit'} onClose={() => setDialog(null)} />
+      {r.auth.kind === 'https' && <TokenModal repo={r} open={dialog === 'token'} onClose={() => setDialog(null)} />}
+      <DeleteRepoModal repo={r} open={dialog === 'delete'} onClose={() => setDialog(null)} />
     </>
   );
 }

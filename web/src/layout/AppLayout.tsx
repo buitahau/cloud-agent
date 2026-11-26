@@ -93,7 +93,12 @@ function Nav({ onNavigate }: { onNavigate?: () => void }) {
           key: `repo:${r.id}`,
           icon: <span className="nav-dot"><Dot color={healthTone(token, r.health).solid} live={Boolean(r.running_job_id)} title={r.health.replace('_', ' ')} /></span>,
           label: (
-            <Link to={`/repos/${encodeURIComponent(r.id)}`} onClick={onNavigate} title={r.url_display}>
+            <Link
+              to={`/repos/${encodeURIComponent(r.id)}`}
+              onClick={onNavigate}
+              title={r.enabled ? r.url_display : `${r.url_display} (disabled)`}
+              style={r.enabled ? undefined : { opacity: 0.55 }}
+            >
               {r.id}
             </Link>
           ),
