@@ -86,29 +86,147 @@ Ctrl-C / SIGTERM shuts down gracefully: queued jobs are marked failed, running c
 
 ## Deploy (Docker + VPS)
 
-The image (`Dockerfile`) builds the dashboard, installs the Claude Code CLI globally and runs as the non-root `node`
-user. Claude's subscription login is **not** baked into the image: it lives in the `claude-home` volume
-(`/home/node`), so it survives redeploys. `.github/workflows/ci-cd.yml` tests every push/PR; on `main` it pushes
-`ghcr.io/<owner>/cloud-agent:<sha>` and deploys it to the VPS over SSH (`docker compose pull && up -d`).
+### How it fits together
 
-One-time VPS setup (Docker + compose plugin installed):
+The Docker image holds **only code**: the server, the built dashboard and the Claude Code CLI. Config and state are
+never baked in (`.dockerignore` excludes `.env`, `repos.json`, `data`, `workspaces`). They live on the VPS and are
+attached when the container starts:
+
+| What | Where on the VPS | Container path | Who puts it there |
+|---|---|---|---|
+| `docker-compose.yml` | deploy dir (`/opt/cloud-agent`) | — | CI, on every deploy |
+| `.env` (secrets) | deploy dir | env vars | **you**, once |
+| `repos.json` | deploy dir (bind mount, read-only) | `/app/repos.json` | **you**, once |
+| Claude login | volume `claude-home` | `/home/node` | **you**, once (`/login`) |
+| repo clones | volume `workspaces` | `/app/workspaces` | the app |
+| job history (`jobs.jsonl`) | volume `data` | `/app/data/jobs.jsonl` | the app |
+
+So the same image runs anywhere, secrets never reach the registry, and redeploys keep the login and job history.
+Don't copy your local `jobs.jsonl` or `workspaces/` to the VPS: the app creates its own.
+
+On every push to `main`, `.github/workflows/ci-cd.yml` runs the tests and builds and pushes
+`ghcr.io/<owner>/cloud-agent:<sha>` (and `:latest`). It then copies `docker-compose.yml` to the VPS over SSH and runs
+`docker compose pull && docker compose up -d` there. Pull requests only run the tests.
+
+### 1. Prepare the VPS (once)
+
+Install Docker Engine with the compose plugin, then create a deploy user that can run Docker:
 
 ```bash
-sudo mkdir -p /opt/cloud-agent && sudo chown $USER /opt/cloud-agent && cd /opt/cloud-agent
-# copy docker-compose.yml, .env and repos.json here (repos.json: "workspaceRoot": "./workspaces" is fine)
-echo <PAT with read:packages> | docker login ghcr.io -u <github-user> --password-stdin   # if the image is private
-docker compose pull
-docker compose run --rm cloud-agent claude      # then /login (open the URL, paste the code), then /exit
-docker compose up -d && docker compose logs -f  # expect "Claude auth OK" and "Listening on :8080"
+sudo adduser --disabled-password deploy
+sudo usermod -aG docker deploy
+sudo mkdir -p /opt/cloud-agent && sudo chown deploy: /opt/cloud-agent
 ```
 
-GitHub repo settings: secrets `VPS_HOST`, `VPS_USER` (a user in the `docker` group), `VPS_SSH_KEY` (private key
-whose public half is in that user's `authorized_keys`), optional `VPS_PORT`; optional variable `DEPLOY_DIR`
-(default `/opt/cloud-agent`); an environment named `production` (add required reviewers there to gate deploys).
+Generate an SSH key pair for CI (on your machine) and authorize it for that user:
 
-Notes: the port is bound to `127.0.0.1` — put Caddy/nginx with TLS in front. A deploy restarts the service, so
-running jobs are marked failed. Claude jobs run *inside the container*, so add any toolchain the target repos need
-(browsers for e2e, python, ...) to the Dockerfile.
+```bash
+ssh-keygen -t ed25519 -f cloud-agent-deploy -N '' -C cloud-agent-ci
+ssh-copy-id -i cloud-agent-deploy.pub deploy@<vps>     # or append it to ~deploy/.ssh/authorized_keys
+```
+
+### 2. Configure GitHub (once)
+
+In the repo, go to **Settings → Secrets and variables → Actions** and add:
+
+| Name | Kind | Value |
+|---|---|---|
+| `VPS_HOST` | secret | VPS hostname or IP |
+| `VPS_USER` | secret | `deploy` |
+| `VPS_SSH_KEY` | secret | contents of the **private** key `cloud-agent-deploy` |
+| `VPS_PORT` | secret, optional | SSH port (default `22`) |
+| `DEPLOY_DIR` | variable, optional | deploy dir (default `/opt/cloud-agent`) |
+
+Then go to **Settings → Environments** and create an environment named `production`. Add required reviewers there if
+deploys should wait for approval.
+
+### 3. Put the config on the VPS (once)
+
+Copy the compose file and your config into the deploy dir:
+
+```bash
+scp docker-compose.yml .env repos.json deploy@<vps>:/opt/cloud-agent/
+```
+
+Inside the container, paths are container paths, not paths on your laptop. Check these before copying:
+
+- `.env`: `PORT`, `REPOS_FILE` and `JOBS_FILE` are overridden by `docker-compose.yml`, so their values don't matter.
+  Set real values for `API_KEY`, `ADMIN_PASSWORD` and every `GIT_TOKEN_<NAME>`.
+- `repos.json`: keep `"workspaceRoot": "./workspaces"` (it resolves to `/app/workspaces`, the volume). Any other
+  path puts clones in the container's own filesystem, which a redeploy wipes.
+- **ssh repos**: put the keys in `/opt/cloud-agent/ssh/` on the VPS, then uncomment the `./ssh:/run/ssh-keys:ro` line
+  in `docker-compose.yml` and commit that change, since CI overwrites the VPS copy. Point
+  `"sshKeyPath"` at `/run/ssh-keys/<key>`. The container runs as uid 1000, so the keys must be readable by it:
+  ```bash
+  sudo chown -R 1000:1000 /opt/cloud-agent/ssh && chmod 600 /opt/cloud-agent/ssh/*
+  ```
+  Host keys are accepted on first use and remembered in the `claude-home` volume.
+
+If the GHCR package is private, log the VPS in to the registry once with a GitHub PAT that has `read:packages`:
+
+```bash
+echo <PAT> | docker login ghcr.io -u <github-user> --password-stdin
+```
+
+### 4. First deploy and Claude login
+
+1. Build the first image: merge to `main`, or open **Actions → CI/CD → Run workflow** on `main`. CI pushes the image
+   and starts the container. On this first run the container keeps restarting with a "not logged in" error, because
+   Claude isn't logged in yet. That's expected.
+2. Log in to the Claude subscription. Run this on the VPS:
+   ```bash
+   cd /opt/cloud-agent
+   docker compose run --rm cloud-agent claude     # type /login, open the URL, paste the code, then /exit
+   docker compose restart cloud-agent
+   ```
+   The login is saved in the `claude-home` volume, so later deploys reuse it.
+3. Check that it's up:
+   ```bash
+   docker compose logs -f cloud-agent              # expect "Claude auth OK (...)" and "Listening on :8080"
+   curl -s localhost:8080/health
+   ```
+
+### 5. Expose it with TLS
+
+The port is bound to `127.0.0.1:8080` only, so put a reverse proxy with TLS in front of it. Example with Caddy
+(`/etc/caddy/Caddyfile`), which gets the certificate automatically:
+
+```
+agent.example.com {
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1      # stream SSE (/<repo>/run-agent/<id>/events) without buffering
+    }
+}
+```
+
+The API (`x-api-key`) and the dashboard (`https://agent.example.com/admin/`, Basic auth) are then reachable over
+HTTPS.
+
+### Day-to-day operations
+
+Run these in `/opt/cloud-agent` on the VPS:
+
+| Task | Command |
+|---|---|
+| Deploy a new version | push/merge to `main` (CI does the rest) |
+| Add/change a repo | edit `repos.json`, then `docker compose restart cloud-agent` |
+| Change `.env` | edit it, then `docker compose up -d` (`restart` does not re-read `.env`) |
+| Logs | `docker compose logs -f --tail 100 cloud-agent` |
+| Status | `docker compose ps` |
+| Roll back | `IMAGE=ghcr.io/<owner>/cloud-agent:<old-sha> docker compose up -d` (the next CI deploy replaces it) |
+| Claude login expired | repeat the `docker compose run --rm cloud-agent claude` → `/login` step, then restart |
+| Look at job history | `docker compose exec cloud-agent tail -n 5 /app/data/jobs.jsonl` |
+| Reset a broken clone | `docker compose exec cloud-agent rm -rf /app/workspaces/<id>` (re-cloned by the next job) |
+
+`docker compose down` keeps the volumes. `docker compose down -v` **deletes** them, including the Claude login, the
+job history and the clones.
+
+Notes:
+- A deploy or restart stops the service, so jobs that are running at that moment are marked failed.
+- Claude jobs run *inside the container*. Add any toolchain the target repos need (browsers for e2e tests, python,
+  ...) to the `Dockerfile`.
+- To test the image locally: `docker compose build && docker compose up` (uses the `.env` and `repos.json` in the
+  repo root).
 
 ## Admin dashboard
 
