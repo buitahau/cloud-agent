@@ -7,6 +7,7 @@ Several repos can be configured; a read-only admin dashboard at `/admin/` shows 
 
 Spec: [docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md). Design notes: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
 Multi-repo + dashboard design: [docs/MULTI_REPO_PLAN.md](docs/MULTI_REPO_PLAN.md).
+Repos in SQLite + encrypted per-repo tokens (proposed): [docs/SQLITE_REPOS_PLAN.md](docs/SQLITE_REPOS_PLAN.md).
 
 ## Setup
 
