@@ -3,11 +3,11 @@
 // itself and never calls dotenv (src/index.js does `dotenv.config()` first).
 // Fail fast: any problem -> throw ConfigError listing ALL problems found.
 
-import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { isValidBranchName, isValidRepoId, validateRepoUrl, RESERVED_REPO_IDS } from './lib/validate.js';
+import { isSameOrInside } from './lib/repoValidate.js';
+import { parseKeyRingEnv } from './secrets.js';
 
 /** Directory holding this service's code (src/..). */
 const SERVICE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,23 +23,15 @@ export const PERMISSION_MODES = Object.freeze([
 ]);
 
 /**
- * One target repository (from REPOS_FILE).
- * @typedef {Object} RepoConfig
- * @property {string}      id             url-safe id, used in routes (/<id>/run-agent) and as the workspace dir name
- * @property {string}      url            git remote URL (validated by validateRepoUrl)
- * @property {'https'|'ssh'|'local'} kind
- * @property {string}      defaultBranch  branch used when a job does not name one (default "main")
- * @property {string}      workspaceDir   ABSOLUTE: <workspaceRoot>/<id>
- * @property {string|null} sshKeyPath     auth.sshKeyPath, ~-expanded (ssh URLs only)
- * @property {string|null} tokenEnv       auth.tokenEnv — the NAME of the env var holding the token (https URLs only)
- * @property {string|null} token          value of that env var
- */
-
-/**
  * @typedef {Object} Config
- * @property {string}      reposFile            REPOS_FILE resolved to an absolute path (default "./repos.json")
- * @property {string}      workspaceRoot        absolute; repos are cloned to <workspaceRoot>/<id>
- * @property {ReadonlyArray<RepoConfig>} repos  at least one
+ * @property {string}      dbFile               DB_FILE resolved to an absolute path (default "./data/cloud-agent.db")
+ * @property {string}      reposFile            REPOS_FILE resolved to an absolute path (default "./repos.json"); only
+ *                                              read once, for the first-boot import into an empty database
+ * @property {boolean}     reposFileExplicit    whether REPOS_FILE was set
+ * @property {string}      workspaceRoot        WORKSPACE_ROOT (default "./workspaces"), absolute; repos are cloned to <workspaceRoot>/<id>
+ * @property {import('./secrets.js').KeyRing} keyRing  from MASTER_KEY (+ MASTER_KEY_PREVIOUS); never holds raw key strings
+ * @property {boolean}     allowLocalRepos      ALLOW_LOCAL_REPOS (default false): allow absolute-path / file:// repos
+ * @property {string}      sshKeysDir           SSH_KEYS_DIR (default "/run/ssh-keys", ~-expanded): ssh keys must live inside it
  * @property {string}      claudeBin            CLAUDE_BIN (default "claude")
  * @property {string}      claudePermissionMode CLAUDE_PERMISSION_MODE (default "bypassPermissions"), one of PERMISSION_MODES
  * @property {number}      claudeMaxTurns       CLAUDE_MAX_TURNS (default 50), integer >= 1
@@ -67,18 +59,17 @@ export class ConfigError extends Error {
 }
 
 /** Env vars from the single-repo version; setting any of them is a mistake now. */
-const LEGACY_VARS = Object.freeze(['REPO_URL', 'REPO_BRANCH', 'WORKSPACE_DIR', 'GIT_TOKEN', 'GIT_SSH_KEY_PATH']);
+const LEGACY_VARS = Object.freeze(['REPO_URL', 'REPO_BRANCH', 'WORKSPACE_DIR', 'GIT_SSH_KEY_PATH']);
 
 /**
- * Build and validate the config from an env-like object plus the repos file it points at.
+ * Build and validate the config from an env-like object. Env only: never reads files (repos live in the
+ * database, see src/repoStore.js; REPOS_FILE is only imported once, by src/repoImport.js).
  *
  * Rules:
  *  - Treat empty strings / whitespace-only env values as "unset". Trim all values.
- *  - Required: API_KEY, and a readable REPOS_FILE (default ./repos.json) with at least one repo.
- *  - Every remote repo needs its OWN credential: https -> auth.tokenEnv (env var must be set),
- *    ssh -> auth.sshKeyPath (file must exist). Local paths take no auth. There is no global fallback.
+ *  - Required: API_KEY and MASTER_KEY (base64 of 32 bytes).
  *  - Integers: parse with Number(); must be Number.isInteger and within range, else problem.
- *  - Never put secret values (tokens, API key, admin password) into error messages.
+ *  - Never put secret values (API key, admin password, master keys) into error messages.
  *  - Return Object.freeze()d Config.
  *
  * @param {Record<string, string|undefined>} env  usually process.env
@@ -119,14 +110,9 @@ export function loadConfig(env, opts = {}) {
   const apiKey = get('API_KEY');
   if (apiKey === null) problems.push('API_KEY is required');
 
-  const reposFile = path.resolve(cwd, get('REPOS_FILE') ?? './repos.json');
-  const { workspaceRoot, repos } = loadReposFile(reposFile, env, cwd, problems);
-
-  // A repo may legitimately name e.g. GIT_TOKEN as its auth.tokenEnv; only flag vars nothing refers to.
-  const referenced = new Set(repos.map((r) => r.tokenEnv).filter(Boolean));
-  const legacy = LEGACY_VARS.filter((k) => get(k) !== null && !referenced.has(k));
+  const legacy = LEGACY_VARS.filter((k) => get(k) !== null);
   if (legacy.length) {
-    problems.unshift(`${legacy.join(', ')} ${legacy.length > 1 ? 'are' : 'is'} no longer supported; define repos in REPOS_FILE (see repos.example.json)`);
+    problems.unshift(`${legacy.join(', ')} ${legacy.length > 1 ? 'are' : 'is'} no longer supported; repos are stored in the database (imported once from REPOS_FILE, see repos.example.json)`);
   }
 
   const claudePermissionMode = get('CLAUDE_PERMISSION_MODE') ?? 'bypassPermissions';
@@ -153,12 +139,37 @@ export function loadConfig(env, opts = {}) {
     if (apiKey !== null && adminPassword === apiKey) problems.push('ADMIN_PASSWORD must differ from API_KEY');
   }
 
+  const reposFileRaw = get('REPOS_FILE');
+  const reposFile = path.resolve(cwd, reposFileRaw ?? './repos.json');
+  const dbFile = path.resolve(cwd, get('DB_FILE') ?? './data/cloud-agent.db');
+  const workspaceRoot = path.resolve(cwd, get('WORKSPACE_ROOT') ?? './workspaces');
+  // git clean -fdx inside a workspace that contains the service would delete the service.
+  if ([path.resolve(cwd), SERVICE_DIR].some((dir) => isSameOrInside(dir, workspaceRoot))) {
+    problems.push(`WORKSPACE_ROOT must not be the service directory or one of its parents (${workspaceRoot})`);
+  }
+  if (isSameOrInside(dbFile, workspaceRoot)) problems.push(`DB_FILE must not be inside WORKSPACE_ROOT (${dbFile})`);
+  const allowLocalRepos = bool('ALLOW_LOCAL_REPOS', false);
+  const sshKeysDir = path.resolve(cwd, expandHome(get('SSH_KEYS_DIR') ?? '/run/ssh-keys'));
+
+  const masterKey = get('MASTER_KEY');
+  if (masterKey === null) {
+    problems.push('MASTER_KEY is required: it encrypts the repo tokens in DB_FILE (generate one with: openssl rand -base64 32)');
+  }
+  const { keyRing, problems: keyProblems } = parseKeyRingEnv({
+    masterKey, masterKeyPrevious: get('MASTER_KEY_PREVIOUS'), apiKey, adminPassword,
+  });
+  problems.push(...keyProblems);
+
   if (problems.length) throw new ConfigError(problems);
 
   return Object.freeze({
+    dbFile,
     reposFile,
-    workspaceRoot: /** @type {string} */ (workspaceRoot),
-    repos: Object.freeze(repos.map((r) => Object.freeze(r))),
+    reposFileExplicit: reposFileRaw !== null,
+    workspaceRoot,
+    keyRing: /** @type {import('./secrets.js').KeyRing} */ (keyRing),
+    allowLocalRepos,
+    sshKeysDir,
     claudeBin: get('CLAUDE_BIN') ?? 'claude',
     claudePermissionMode,
     claudeMaxTurns,
@@ -177,146 +188,6 @@ export function loadConfig(env, opts = {}) {
 }
 
 /**
- * Read + validate the repos file. Pushes problems instead of throwing.
- *
- * Shape:
- *   {
- *     "workspaceRoot": "./workspaces",          // optional, resolved against cwd
- *     "repos": [
- *       { "id": "web", "url": "https://github.com/org/web.git", "defaultBranch": "dev",
- *         "auth": { "tokenEnv": "GIT_TOKEN_WEB" } },
- *       { "id": "api", "url": "git@github.com:org/api.git", "auth": { "sshKeyPath": "~/.ssh/id_api" } }
- *     ]
- *   }
- *
- * @param {string} file
- * @param {Record<string, string|undefined>} env
- * @param {string} cwd
- * @param {string[]} problems
- * @returns {{ workspaceRoot: string|null, repos: RepoConfig[] }}
- */
-function loadReposFile(file, env, cwd, problems) {
-  const out = { workspaceRoot: null, repos: [] };
-  let raw;
-  try {
-    raw = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    problems.push(err?.code === 'ENOENT'
-      ? `REPOS_FILE not found: ${file} (copy repos.example.json to get started)`
-      : `REPOS_FILE could not be read: ${file} (${err?.code ?? err?.message})`);
-    return out;
-  }
-  let doc;
-  try {
-    doc = JSON.parse(raw);
-  } catch (err) {
-    problems.push(`REPOS_FILE is not valid JSON: ${err.message}`);
-    return out;
-  }
-  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    problems.push('REPOS_FILE must contain a JSON object with a "repos" array');
-    return out;
-  }
-  if (doc.workspaceRoot !== undefined && (typeof doc.workspaceRoot !== 'string' || doc.workspaceRoot.trim() === '')) {
-    problems.push('REPOS_FILE: workspaceRoot must be a non-empty string');
-  }
-  const workspaceRoot = path.resolve(cwd, typeof doc.workspaceRoot === 'string' && doc.workspaceRoot.trim() ? doc.workspaceRoot.trim() : './workspaces');
-  out.workspaceRoot = workspaceRoot;
-
-  // git clean -fdx inside a workspace that contains the service would delete the service.
-  if ([path.resolve(cwd), SERVICE_DIR].some((dir) => isSameOrInside(dir, workspaceRoot))) {
-    problems.push(`REPOS_FILE: workspaceRoot must not be the service directory or one of its parents (${workspaceRoot})`);
-  }
-
-  if (!Array.isArray(doc.repos) || doc.repos.length === 0) {
-    problems.push('REPOS_FILE: "repos" must be a non-empty array');
-    return out;
-  }
-
-  const seen = new Set();
-  doc.repos.forEach((r, i) => {
-    const where = `REPOS_FILE repos[${i}]`;
-    if (r === null || typeof r !== 'object' || Array.isArray(r)) {
-      problems.push(`${where} must be an object`);
-      return;
-    }
-    const id = r.id;
-    const label = typeof id === 'string' ? `${where} "${id}"` : where;
-    if (!isValidRepoId(id)) {
-      problems.push(`${label}: id must be 1-40 chars of a-z, 0-9 and "-" (not at the ends), and not one of ${RESERVED_REPO_IDS.join(', ')}`);
-    } else if (seen.has(id)) {
-      problems.push(`${label}: duplicate id`);
-    } else {
-      seen.add(id);
-    }
-
-    const urlCheck = validateRepoUrl(r.url);
-    if (!urlCheck.ok) problems.push(`${label}: ${urlCheck.error}`);
-
-    const defaultBranch = r.defaultBranch ?? 'main';
-    if (!isValidBranchName(defaultBranch)) problems.push(`${label}: defaultBranch is not a valid branch name`);
-
-    const auth = r.auth ?? null;
-    if (auth !== null && (typeof auth !== 'object' || Array.isArray(auth))) {
-      problems.push(`${label}: auth must be an object`);
-    }
-    const a = auth && typeof auth === 'object' ? auth : {};
-    let sshKeyPath = null;
-    let tokenEnv = null;
-    let token = null;
-    if (a.sshKeyPath !== undefined) {
-      if (typeof a.sshKeyPath !== 'string' || a.sshKeyPath.trim() === '') {
-        problems.push(`${label}: auth.sshKeyPath must be a non-empty string`);
-      } else {
-        sshKeyPath = expandHome(a.sshKeyPath.trim());
-        if (sshKeyPath.includes("'")) problems.push(`${label}: auth.sshKeyPath must not contain a single quote`);
-        else if (!fs.existsSync(sshKeyPath)) problems.push(`${label}: auth.sshKeyPath does not exist: ${sshKeyPath}`);
-      }
-    }
-    if (a.tokenEnv !== undefined) {
-      if (typeof a.tokenEnv !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(a.tokenEnv)) {
-        problems.push(`${label}: auth.tokenEnv must be an environment variable name`);
-      } else {
-        tokenEnv = a.tokenEnv;
-        const v = env[tokenEnv];
-        token = typeof v === 'string' && v.trim() !== '' ? v.trim() : null;
-        if (token === null) problems.push(`${label}: environment variable ${tokenEnv} (auth.tokenEnv) is not set`);
-      }
-    }
-
-    if (urlCheck.ok) {
-      if (urlCheck.kind === 'https') {
-        if (a.tokenEnv === undefined) problems.push(`${label}: https repos need their own credential: set auth.tokenEnv`);
-        if (a.sshKeyPath !== undefined) problems.push(`${label}: auth.sshKeyPath only applies to ssh URLs`);
-      } else if (urlCheck.kind === 'ssh') {
-        if (a.sshKeyPath === undefined) problems.push(`${label}: ssh repos need their own credential: set auth.sshKeyPath`);
-        if (a.tokenEnv !== undefined) problems.push(`${label}: auth.tokenEnv only applies to https URLs`);
-      } else if (a.tokenEnv !== undefined || a.sshKeyPath !== undefined) {
-        problems.push(`${label}: local repos take no auth`);
-      }
-    }
-
-    out.repos.push({
-      id: typeof id === 'string' ? id : '',
-      url: typeof r.url === 'string' ? r.url : '',
-      kind: urlCheck.ok ? urlCheck.kind : 'local',
-      defaultBranch: typeof defaultBranch === 'string' ? defaultBranch : 'main',
-      workspaceDir: path.join(workspaceRoot, typeof id === 'string' ? id : `invalid-${i}`),
-      sshKeyPath,
-      tokenEnv,
-      token,
-    });
-  });
-  return out;
-}
-
-/** True iff `child` is `parent` or lies inside it. Both absolute. */
-function isSameOrInside(child, parent) {
-  const rel = path.relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
-}
-
-/**
  * Expand a leading "~" or "~/" to the home directory. Other strings returned unchanged.
  * @param {string} p
  * @param {string} [home] defaults to os.homedir()
@@ -329,16 +200,19 @@ export function expandHome(p, home = os.homedir()) {
 }
 
 /**
- * Copy of the config safe to log: apiKey, adminPassword and every repo token replaced by "***" (or null if unset).
+ * Copy of the config safe to log: apiKey and adminPassword replaced by "***" (or null if unset); the key ring
+ * is replaced by masterKey / masterKeyPrevious showing only key ids.
  * @param {Config} config
  * @returns {Record<string, unknown>}
  */
 export function redactConfig(config) {
   const mask = (v) => (v ? '***' : null);
+  const { keyRing, ...rest } = config;
   return {
-    ...config,
-    repos: (config.repos ?? []).map((r) => ({ ...r, token: mask(r.token) })),
+    ...rest,
     apiKey: mask(config.apiKey),
     adminPassword: mask(config.adminPassword),
+    masterKey: keyRing ? `*** (key id ${keyRing.currentKeyId})` : null,
+    masterKeyPrevious: keyRing ? keyRing.keyIds.slice(1).map((k) => `*** (key id ${k})`) : [],
   };
 }

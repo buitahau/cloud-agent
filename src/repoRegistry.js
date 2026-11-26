@@ -1,6 +1,7 @@
 // src/repoRegistry.js
-// The configured repos (from REPOS_FILE) with one GitSync each, plus repo health derived from job history.
-// Repos are fixed at startup: changing them means editing REPOS_FILE and restarting.
+// The repos (loaded from the database once at startup) with one GitSync each, plus repo health derived from
+// job history. Tokens are never held here: each GitSync reads its repo's token from the store per sync.
+// The set of repos is fixed for the process lifetime; changing it at runtime comes with the admin API (PR 3).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,8 +9,20 @@ import { createGitSync } from './gitSync.js';
 import { STATUS } from './jobStore.js';
 
 /**
+ * One target repository (a repos row plus its workspace). No token field.
+ * @typedef {Object} RepoConfig
+ * @property {string}      id             url-safe id, used in routes (/<id>/run-agent) and as the workspace dir name
+ * @property {string}      url            git remote URL
+ * @property {'https'|'ssh'|'local'} kind
+ * @property {string}      defaultBranch  branch used when a job does not name one
+ * @property {string|null} sshKeyPath     absolute (ssh URLs only)
+ * @property {boolean}     enabled
+ * @property {string}      workspaceDir   ABSOLUTE: <workspaceRoot>/<id>
+ */
+
+/**
  * @typedef {Object} RepoEntry
- * @property {import('./config.js').RepoConfig} config
+ * @property {RepoConfig} config
  * @property {import('./gitSync.js').GitSync} gitSync
  * @property {string} workspaceDir
  */
@@ -34,22 +47,33 @@ import { STATUS } from './jobStore.js';
  */
 
 /**
- * @param {ReadonlyArray<import('./config.js').RepoConfig>} repos
- * @param {{ gitTimeoutMs: number, secretEnvNames?: string[], gitSyncFactory?: typeof createGitSync }} opts
+ * @param {{ repoStore: Pick<import('./repoStore.js').RepoStore, 'list'|'getToken'>, workspaceRoot: string, gitTimeoutMs: number,
+ *           secretEnvNames?: string[], gitSyncFactory?: typeof createGitSync }} opts
  */
-export function createRepoRegistry(repos, opts) {
+export function createRepoRegistry(opts) {
   const factory = opts.gitSyncFactory ?? createGitSync;
   /** @type {Map<string, RepoEntry>} */
   const entries = new Map();
-  for (const r of repos) {
-    entries.set(r.id, {
-      config: r,
-      workspaceDir: r.workspaceDir,
+  for (const rec of opts.repoStore.list()) {
+    const workspaceDir = path.join(opts.workspaceRoot, rec.id);
+    /** @type {RepoConfig} */
+    const config = Object.freeze({
+      id: rec.id,
+      url: rec.url,
+      kind: rec.kind,
+      defaultBranch: rec.defaultBranch,
+      sshKeyPath: rec.sshKeyPath ?? null,
+      enabled: rec.enabled !== false,
+      workspaceDir,
+    });
+    entries.set(rec.id, {
+      config,
+      workspaceDir,
       gitSync: factory({
-        repoUrl: r.url,
-        workspaceDir: r.workspaceDir,
-        sshKeyPath: r.sshKeyPath ?? null,
-        token: r.token ?? null,
+        repoUrl: rec.url,
+        workspaceDir,
+        sshKeyPath: config.sshKeyPath,
+        getToken: () => opts.repoStore.getToken(rec.id),
         timeoutMs: opts.gitTimeoutMs,
         secretEnvNames: opts.secretEnvNames ?? [],
       }),
@@ -62,7 +86,7 @@ export function createRepoRegistry(repos, opts) {
     /** @param {string} id */
     has: (id) => entries.has(id),
     ids: () => [...entries.keys()],
-    /** @returns {import('./config.js').RepoConfig[]} */
+    /** @returns {RepoConfig[]} */
     list: () => [...entries.values()].map((e) => e.config),
 
     /**

@@ -5,8 +5,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { runProcess } from './lib/processRunner.js';
-import { isValidBranchName } from './lib/validate.js';
+import { isValidBranchName, validateRepoUrl } from './lib/validate.js';
 import { withoutSecrets } from './lib/secretEnv.js';
+import { SecretDecryptError } from './secrets.js';
 
 /**
  * Thrown for any git failure. `step` names the failing command so the job error is readable.
@@ -30,12 +31,12 @@ export class GitSyncError extends Error {
  * @property {string}      repoUrl
  * @property {string}      workspaceDir     absolute path
  * @property {string|null} [sshKeyPath]     absolute (already ~-expanded)
- * @property {string|null} [token]
+ * @property {() => string|null} [getToken]  the repo's https token; called once per sync, only for https:// URLs; may throw
  * @property {number}      timeoutMs        per git command
  * @property {string}      [gitBin='git']
  * @property {import('./lib/processRunner.js').RunFn} [run=runProcess]
  * @property {NodeJS.ProcessEnv} [baseEnv=process.env]
- * @property {string[]} [secretEnvNames=[]]  env var names to hide from git (repo tokenEnv names)
+ * @property {string[]} [secretEnvNames=[]]  env var names to hide from git (token env var names from repos.json)
  */
 
 /**
@@ -49,6 +50,8 @@ export class GitSyncError extends Error {
  * Factory. Exact command sequence for sync(branch) (all via `run`, no shell, cwd as noted):
  *
  *  0. if (!isValidBranchName(branch)) throw new GitSyncError('validate', 'invalid branch name')
+ *     token = getToken() for https URLs (a throw -> GitSyncError('validate', 'token cannot be decrypted' |
+ *     'token could not be read'), message never includes the cause's text)
  *  1. if exists(path.join(workspaceDir, '.git')):
  *       - git remote get-url origin must equal repoUrl (ignoring a trailing "/" or ".git"),
  *         else GitSyncError('validate', ...) — never sync/run in a clone of another repo
@@ -57,8 +60,9 @@ export class GitSyncError extends Error {
  *       - mkdir -p path.dirname(workspaceDir)
  *       - git clone --no-checkout -- <repoUrl> <workspaceDir>          (cwd: dirname(workspaceDir))
  *       - on failure: fs.rmSync(workspaceDir, {recursive:true, force:true}) so the next job retries a clean clone
- *  2. git fetch --prune origin +refs/heads/<branch>:refs/remotes/origin/<branch>   (cwd: workspaceDir)
- *       explicit refspec so origin/<branch> exists even for branches not in the clone's default refspec
+ *  2. git fetch --upload-pack=git-upload-pack --prune origin +refs/heads/<branch>:refs/remotes/origin/<branch>
+ *       (cwd: workspaceDir) explicit refspec so origin/<branch> exists even for branches not in the clone's
+ *       default refspec; explicit --upload-pack so a planted remote.origin.uploadpack never runs
  *  3. git checkout -f -B <branch> origin/<branch>
  *       (equivalent to spec's `checkout -f` + works when the local branch doesn't exist yet)
  *  4. git reset --hard origin/<branch>
@@ -79,7 +83,7 @@ export function createGitSync(opts) {
     repoUrl,
     workspaceDir,
     sshKeyPath = null,
-    token = null,
+    getToken = () => null,
     timeoutMs,
     gitBin = 'git',
     run = runProcess,
@@ -91,6 +95,14 @@ export function createGitSync(opts) {
     async sync(branch, log = () => {}, signal) {
       const safeLog = (line) => { try { log(line); } catch { /* ignore */ } };
       if (!isValidBranchName(branch)) throw new GitSyncError('validate', 'invalid branch name');
+      let token = null;
+      if (repoUrl.startsWith('https://')) {
+        try {
+          token = getToken() ?? null;
+        } catch (err) {
+          throw new GitSyncError('validate', err instanceof SecretDecryptError ? 'token cannot be decrypted' : 'token could not be read');
+        }
+      }
       const env = buildGitEnv({ baseEnv, repoUrl, sshKeyPath, token, secretEnvNames });
 
       const git = async (step, args, cwd) => {
@@ -140,7 +152,7 @@ export function createGitSync(opts) {
       }
 
       const ref = `origin/${branch}`;
-      await git('fetch', ['fetch', '--prune', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], workspaceDir);
+      await git('fetch', ['fetch', '--upload-pack=git-upload-pack', '--prune', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], workspaceDir);
       await git('checkout', ['checkout', '-f', '-B', branch, ref], workspaceDir);
       await git('reset', ['reset', '--hard', ref], workspaceDir);
       await git('clean', ['clean', '-fdx', '-e', 'node_modules'], workspaceDir);
@@ -151,44 +163,68 @@ export function createGitSync(opts) {
 }
 
 /**
+ * Forced on every git command at command-line scope (GIT_CONFIG_*), which beats a workspace's planted
+ * .git/config (a job's claude run can write there).
+ */
+export const GIT_HARDENING_CONFIG = Object.freeze([
+  ['core.hooksPath', '/dev/null'], // .git/hooks and a planted core.hooksPath never run
+  ['core.fsmonitor', 'false'],
+  ['credential.helper', ''], // an empty value resets ALL helpers, incl. credential.<url>.helper
+  ['core.askPass', ''],
+]);
+
+/** GIT_ALLOW_PROTOCOL per repo kind: a repo only ever talks its own transport. */
+const PROTOCOL_BY_KIND = Object.freeze({ https: 'https', ssh: 'ssh', local: 'file' });
+
+/**
  * Build the child env for git. Never mutates baseEnv. Secrets go in env, never in argv or .git/config.
  *
- *  - baseEnv minus service secrets (withoutSecrets); the repo's own token reaches git only via GIT_CONFIG_VALUE_0.
- *  - Always: GIT_TERMINAL_PROMPT=0 (never hang on a credential prompt) and
- *    GIT_ALLOW_PROTOCOL=https:ssh:file (no ext::/fd::/git:// transports, also for submodules).
+ *  - baseEnv minus service secrets (withoutSecrets) and minus inherited GIT_CONFIG_COUNT / KEY_n / VALUE_n /
+ *    PARAMETERS; the repo's own token reaches git only via the last GIT_CONFIG_VALUE_n.
+ *  - Always: GIT_TERMINAL_PROMPT=0 (never hang on a credential prompt) and GIT_ALLOW_PROTOCOL set to the
+ *    repo's own transport (https | ssh | file; "https:ssh:file" if the URL does not validate), so no
+ *    ext::/fd::/git:// transports, also for submodules.
  *  - Always GIT_TRACE_REDACT=1 (overrides the operator's value) so GIT_TRACE_CURL/GIT_TRACE_PACKET can't write
  *    the Authorization header into job logs.
  *  - If sshKeyPath: GIT_SSH_COMMAND = `ssh -i '<sshKeyPath>' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`
  *    (single-quote the path; reject paths containing a single quote).
- *  - If token AND repoUrl starts with "https://": inject an auth header via git's env-config (git >= 2.31),
+ *  - GIT_CONFIG_COUNT / KEY_n / VALUE_n = GIT_HARDENING_CONFIG (hooks, fsmonitor, credential helpers, askPass
+ *    disabled), plus, if token AND repoUrl starts with "https://", an auth header as the LAST entry (index 4),
  *    scoped to the repo's own origin so redirects/submodules on other hosts never receive the token:
- *      GIT_CONFIG_COUNT=1
- *      GIT_CONFIG_KEY_0=http.<https://host[:port]/>.extraHeader
- *      GIT_CONFIG_VALUE_0=`Authorization: Basic ${base64('x-access-token:' + token)}`
+ *      GIT_CONFIG_KEY_4=http.<https://host[:port]/>.extraHeader
+ *      GIT_CONFIG_VALUE_4=`Authorization: Basic ${base64('x-access-token:' + token)}`
  *    (works for GitHub PATs and GitHub App tokens).
+ *  Known limit: filter drivers and http.* overrides planted in a workspace's .git/config are not neutralised.
  *
  * @param {{ baseEnv: NodeJS.ProcessEnv, repoUrl: string, sshKeyPath?: string|null, token?: string|null, secretEnvNames?: Iterable<string> }} p
  * @returns {NodeJS.ProcessEnv}
  */
 export function buildGitEnv(p) {
-  const env = {
-    ...withoutSecrets(p.baseEnv, p.secretEnvNames ?? []),
-    GIT_TERMINAL_PROMPT: '0',
-    GIT_ALLOW_PROTOCOL: 'https:ssh:file',
-    GIT_TRACE_REDACT: '1',
-  };
+  const env = withoutSecrets(p.baseEnv, p.secretEnvNames ?? []);
+  for (const k of Object.keys(env)) {
+    if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)$/.test(k)) delete env[k];
+  }
+  const u = validateRepoUrl(p.repoUrl);
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.GIT_ALLOW_PROTOCOL = u.ok ? PROTOCOL_BY_KIND[u.kind] : 'https:ssh:file';
+  env.GIT_TRACE_REDACT = '1';
   if (p.sshKeyPath) {
     if (p.sshKeyPath.includes("'")) throw new GitSyncError('validate', 'sshKeyPath must not contain a single quote');
     env.GIT_SSH_COMMAND = `ssh -i '${p.sshKeyPath}' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new`;
   }
+  /** @type {Array<readonly [string, string]>} */
+  const cfg = [...GIT_HARDENING_CONFIG];
   if (p.token && typeof p.repoUrl === 'string' && p.repoUrl.startsWith('https://')) {
     let origin;
     try { origin = new URL(p.repoUrl).origin; } catch { throw new GitSyncError('validate', 'repo URL is not a valid https URL'); }
     const basic = Buffer.from(`x-access-token:${p.token}`, 'utf8').toString('base64');
-    env.GIT_CONFIG_COUNT = '1';
-    env.GIT_CONFIG_KEY_0 = `http.${origin}/.extraHeader`;
-    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basic}`;
+    cfg.push([`http.${origin}/.extraHeader`, `Authorization: Basic ${basic}`]);
   }
+  env.GIT_CONFIG_COUNT = String(cfg.length);
+  cfg.forEach(([k, v], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = k;
+    env[`GIT_CONFIG_VALUE_${i}`] = v;
+  });
   return env;
 }
 

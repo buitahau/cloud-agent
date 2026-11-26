@@ -9,7 +9,7 @@ export const SECRET_ENV_PATTERN = /^GIT_TOKEN_/;
 
 /**
  * Copy of baseEnv without SECRET_ENV_VARS, names matching SECRET_ENV_PATTERN, and extraNames
- * (the configured repos' auth.tokenEnv names, which may be arbitrary).
+ * (the token env var names named in repos.json, which may be arbitrary).
  * @param {NodeJS.ProcessEnv} baseEnv
  * @param {Iterable<string>} [extraNames=[]]
  * @returns {NodeJS.ProcessEnv}

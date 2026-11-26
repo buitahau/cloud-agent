@@ -1,5 +1,6 @@
 // Covers: T3, T5, T6, T7, T8 against the REAL claude CLI and a REAL target repo. Opt-in: E2E=1 (npm run test:e2e).
-// Reads the project's .env (dotenv) + REPOS_FILE for the target repo and its token. Costs subscription usage. T7/T8 assertions are
+// Reads the project's .env (dotenv) + REPOS_FILE for the target repo and its token; the service imports repos.json +
+// GIT_TOKEN_* into a temp DB (DB_FILE in a tmp dir; MASTER_KEY from .env or random). Costs subscription usage. T7/T8 assertions are
 // heuristic (result text mentions the agent/skill) — confirm manually via logs_tail as well.
 //
 // How it runs: spawns `node src/index.js` with cwd = project root (so dotenv loads the real .env), PORT=0,
@@ -17,6 +18,9 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,23 +34,37 @@ let service = null;
 let base = '';
 let apiKey = '';
 let config = null;
-/** @type {import('../src/config.js').RepoConfig|null} */
+/** @type {import('../src/repoImport.js').ImportRepo|null} */
 let repo = null;
 let serviceLog = '';
+let tmp = '';
 
 before(async () => {
   if (SKIP) return;
   const dotenv = await import('dotenv');
   const parsed = dotenv.config({ path: path.join(ROOT, '.env') }).parsed ?? {};
+  const env = { ...parsed, ...process.env };
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-'));
+  const serviceEnv = {
+    ...process.env,
+    PORT: '0',
+    DB_FILE: path.join(tmp, 'cloud-agent.db'),
+    MASTER_KEY: env.MASTER_KEY?.trim() || crypto.randomBytes(32).toString('base64'),
+  };
   const { loadConfig } = await import('../src/config.js');
-  config = loadConfig({ ...parsed, ...process.env }, { cwd: ROOT });
+  const { loadReposFile } = await import('../src/repoImport.js');
+  config = loadConfig({ ...env, ...serviceEnv }, { cwd: ROOT });
   apiKey = config.apiKey;
-  repo = process.env.E2E_REPO ? config.repos.find((r) => r.id === process.env.E2E_REPO) : config.repos[0];
-  if (!repo) throw new Error(`E2E_REPO "${process.env.E2E_REPO}" is not in ${config.reposFile}`);
+  const f = loadReposFile(config.reposFile, env, { cwd: ROOT, allowLocal: config.allowLocalRepos, sshKeysDir: config.sshKeysDir });
+  if (!f.found || f.problems.length) {
+    throw new Error(`cannot use ${config.reposFile}:\n  - ${f.found ? f.problems.join('\n  - ') : 'file not found'}`);
+  }
+  repo = process.env.E2E_REPO ? f.repos.find((r) => r.id === process.env.E2E_REPO) ?? null : f.repos[0] ?? null;
+  if (!repo) throw new Error(`E2E_REPO "${process.env.E2E_REPO ?? ''}" is not in ${config.reposFile}`);
 
   service = spawn(process.execPath, [path.join(ROOT, 'src', 'index.js')], {
     cwd: ROOT,
-    env: { ...process.env, PORT: '0' },
+    env: serviceEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   service.stdout.setEncoding('utf8').on('data', (c) => { serviceLog += c; });
@@ -62,9 +80,11 @@ before(async () => {
 });
 
 after(async () => {
-  if (!service || service.exitCode !== null) return;
-  service.kill('SIGTERM');
-  await new Promise((r) => { service.on('close', r); setTimeout(r, 15_000); });
+  if (service && service.exitCode === null) {
+    service.kill('SIGTERM');
+    await new Promise((r) => { service.on('close', r); setTimeout(r, 15_000); });
+  }
+  if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 async function submit(body) {
